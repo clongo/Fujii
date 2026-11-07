@@ -24,6 +24,10 @@ public:
         return {*last_deadline, reset};
     }
 
+    void Reset() {
+        last_deadline.reset();
+    }
+
 private:
     std::optional<Clock::time_point> last_deadline;
 };

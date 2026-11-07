@@ -249,8 +249,31 @@ For a build with debug symbols, fewer parallel jobs, and unit tests:
 ```powershell
 docker run --rm --isolation=hyperv --cpus=4 --memory=8g `
     --mount "type=bind,source=$($PWD.Path),target=C:\src" `
-    lichii-build-windows -BuildType RelWithDebInfo -Jobs 4 -Tests
+    lichii-build-windows -BuildType RelWithDebInfo -Jobs 4 -BuildTests
 ```
+
+`-BuildTests` compiles the tests without running them. The Server Core image lacks
+`wlanapi.dll`, required by the emulator's networking code and core tests, so run
+the compiled test executables on the desktop Windows host:
+
+```powershell
+$bin = Join-Path $PWD.Path 'build\docker-windows\bin'
+$previousPlatform = $env:QT_QPA_PLATFORM
+try {
+    $env:QT_QPA_PLATFORM = 'offscreen'
+    foreach ($test in @('tests', 'sdl_window_state_tests', 'update_checker_tests',
+                       'config_tests', 'compatibility_report_tests')) {
+        & (Join-Path $bin "$test.exe")
+        if ($LASTEXITCODE -ne 0) { throw "$test failed with exit code $LASTEXITCODE" }
+    }
+} finally {
+    $env:QT_QPA_PLATFORM = $previousPlatform
+}
+```
+
+`-Tests` both compiles and runs CTest, and fails explicitly if the container lacks
+the required Windows runtime. Bundled dependency self-tests are not part of the
+emulator's test suite.
 
 The default is `Release`, 12 jobs, and no tests, matching the Windows release
 configuration apart from release publishing metadata. The

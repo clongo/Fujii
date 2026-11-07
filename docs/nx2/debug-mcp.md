@@ -106,6 +106,11 @@ server is on but idle, its thread sleeps in `epoll`/IOCP.
 
 ## Safety
 
+`write_memory` is available for reversible guest-memory experiments only when launched with
+`EDEN_NX2_DEBUG_WRITE=1`; `status.write_memory` reports whether it is enabled. Each request
+writes at most 4096 mapped guest bytes and returns the original bytes in `before`. Restore
+those bytes after the experiment. Normal runs reject writes.
+
 - **Loopback only.** `ParseEndpoint` accepts `127.0.0.1`, `::1` and `localhost` and refuses
   every other host, `0.0.0.0` included. The server is reachable only from the PC itself, where
   the agent already has a shell.
@@ -117,7 +122,8 @@ server is on but idle, its thread sleeps in `epoll`/IOCP.
 - **Nothing the server returns comes from game files, keys or firmware.** It returns rendered
   pixels, log lines, frame-dump manifests and shader hashes, which the owner already sends today.
   The memory tools read only the application's guest virtual memory and GPU virtual memory,
-  through their page tables, and never write either. They cannot reach host memory, the key area
+  through their page tables. Reads never write either; the separately gated `write_memory`
+  changes mapped application memory only. They cannot reach host memory, the key area
   or the file system: an address resolves only through a page the guest has mapped. The adapter's `capture_image` reads only PNGs inside
   capture directories that it created in this session, and checks for path escapes.
 - **Logs.** `log_tail` returns lines that already go to `eden_log.txt`.

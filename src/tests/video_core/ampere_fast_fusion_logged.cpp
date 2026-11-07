@@ -367,6 +367,8 @@ struct HalfIR {
                 visitor.SHF_r_imm(word);
             else if ((word >> 48) == 0x5c48)
                 visitor.SHL_reg(word);
+            else if ((word >> 48) == 0x3848)
+                visitor.SHL_imm(word);
             else if ((word >> 48) == 0x5c18)
                 visitor.ISCADD_reg(word);
             else if (((word >> 48) & 0xfffc) == 0x5c10)
@@ -618,13 +620,41 @@ TEST_CASE("Ocarina F2IP packs two rounded unorm bytes", "[video_core][ampere][oo
             CHECK(translation.registers[39] == std::bit_cast<u32>(b));
         }
     }
-    // Other rounding modes and a merge register aren't known forms yet.
-    auto modified = convert;
-    modified.words[2] = 0x000044ff;
-    CHECK_FALSE(LowerToMaxwell(std::array{modified, Exit}));
-    modified = convert;
-    modified.words[2] = 0x00000406;
-    CHECK_FALSE(LowerToMaxwell(std::array{modified, Exit}));
+    for (const u32 rounding : {0U, 1U, 2U, 3U}) {
+        for (const u32 merge : {6U, 255U}) {
+            auto modified = convert;
+            modified.words[2] = 0x400U | (rounding << 14) | merge;
+            const auto result = LowerToMaxwell(std::array{modified, Exit});
+            INFO(result.error);
+            REQUIRE(result);
+            HalfIR converted{result.instructions};
+            for (const f32 input : {0.25f, 0.75f, 127.5f, 128.5f}) {
+                CAPTURE(rounding, merge, input);
+                converted.values.clear();
+                converted.registers.fill(0);
+                converted.registers[40] = std::bit_cast<u32>(input);
+                converted.registers[39] = std::bit_cast<u32>(input);
+                converted.registers[6] = 0x1234abcd;
+                for (const auto& inst : converted.block.Instructions()) {
+                    if (inst.GetOpcode() == IR::Opcode::SetRegister)
+                        converted.registers.at(static_cast<size_t>(inst.Arg(0).Reg())) =
+                            u32(converted.Value(inst.Arg(1)));
+                    else
+                        converted.values.emplace(&inst, converted.Evaluate(inst));
+                }
+                const u32 expected = u32(rounding == 0 ? std::nearbyintf(input)
+                                         : rounding == 1 ? std::floor(input)
+                                         : rounding == 2 ? std::ceil(input)
+                                                         : std::trunc(input));
+                CHECK(converted.registers[41] ==
+                      (expected | (expected << 8) | (merge == 255 ? 0U : 0x12340000U)));
+                CHECK(converted.registers[6] == 0x1234abcd);
+            }
+        }
+    }
+    auto unsupported = convert;
+    unsupported.words[2] |= 1U << 9;
+    CHECK_FALSE(LowerToMaxwell(std::array{unsupported, Exit}));
 }
 
 TEST_CASE("Ocarina uniform multiply adds an immediate rather than reading a register",

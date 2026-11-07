@@ -189,9 +189,10 @@ frame, unavailable results, or an unsupported device can leave no completed samp
 
 - `EDEN_NX2_SWAP_INTERVAL=<n>` forces a nonzero guest interval. It is not a trace switch
   and can change emulation speed. Zero leaves the guest interval selection in effect.
-- `EDEN_NX2_FRAMES_AHEAD` defaults to enabled. A value starting with `0` restores waiting
-  for the current frame. The default waits for the previous frame and also waits for
-  the current one when the previous fence is behind. Trace logging does not change it.
+- `EDEN_NX2_FRAMES_AHEAD=0` waits for the current frame; `=1` opts into waiting one frame
+  ahead, while also waiting for the current frame if the previous fence is behind. With no
+  override, Bananza and Ocarina wait for the current frame; other titles use the adaptive
+  policy. Trace logging does not change it.
 - `EDEN_NX2_GPU_PROFILE`, enabled by presence even with value `0`, reports host GPU-thread
   zones and scheduler counters every 10 seconds. Its zone milliseconds remain CPU-thread
   wall durations, not hardware GPU timestamps. The separate `host_cpu_busy_ms_per_s`

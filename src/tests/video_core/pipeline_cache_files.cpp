@@ -89,7 +89,8 @@ TEST_CASE("Task and mesh disk environments roundtrip all translation state and r
     for (const auto stage : {Shader::Stage::Task, Shader::Stage::Mesh, Shader::Stage::Fragment}) {
         SerializedEnvironment source{stage};
         const std::array<const VideoCommon::GenericEnvironment*, 1> envs{&source};
-        VideoCommon::SerializePipeline(key, envs, path, VideoCommon::VulkanPipelineCacheVersion);
+        VideoCommon::SerializePipeline(key, envs, path, VideoCommon::VulkanPipelineCacheVersion,
+                                       true);
     }
     size_t read = 0;
     VideoCommon::LoadPipelines(
@@ -117,7 +118,7 @@ TEST_CASE("Task and mesh disk environments roundtrip all translation state and r
             u64 restored_key{};
             file.read(reinterpret_cast<char*>(&restored_key), sizeof(restored_key));
             REQUIRE(restored_key == key);
-        });
+        }, true);
     REQUIRE(read == 3);
 }
 

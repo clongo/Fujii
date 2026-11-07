@@ -8,6 +8,7 @@ param(
     [string]$BuildType = 'Release',
     [ValidateRange(1, 1024)]
     [int]$Jobs = 12,
+    [switch]$BuildTests,
     [switch]$Tests
 )
 
@@ -21,7 +22,7 @@ if (-not $env:QT_ROOT_DIR) {
     throw 'QT_ROOT_DIR must point to the installed Qt MSVC x64 kit.'
 }
 
-$testOption = if ($Tests) { 'ON' } else { 'OFF' }
+$testOption = if ($Tests -or $BuildTests) { 'ON' } else { 'OFF' }
 & cmake -S $SourceDir -B $BuildDir -G Ninja `
     "-DCMAKE_BUILD_TYPE=$BuildType" `
     -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl `
@@ -41,6 +42,9 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 if ($Tests) {
+    if (-not (Test-Path -LiteralPath "$env:SystemRoot\System32\wlanapi.dll")) {
+        throw 'The core tests need wlanapi.dll, which Server Core does not provide. Use -BuildTests and run the compiled test executables on desktop Windows (see docs\Build.md).'
+    }
     & ctest --test-dir $BuildDir --output-on-failure --no-tests=error
     if ($LASTEXITCODE -ne 0) {
         throw "Tests failed with exit code $LASTEXITCODE"

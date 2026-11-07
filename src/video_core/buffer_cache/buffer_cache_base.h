@@ -64,10 +64,10 @@ constexpr u32 NUM_VERTEX_BUFFERS = 32;
 constexpr u32 NUM_TRANSFORM_FEEDBACK_BUFFERS = 4;
 constexpr u32 NUM_GRAPHICS_UNIFORM_BUFFERS = 18;
 constexpr u32 NUM_COMPUTE_UNIFORM_BUFFERS = 8;
-// Native shaders can reference more than 16 storage buffers. Dropping a binding
-// shifts all following descriptor payloads into the wrong descriptor types.
-constexpr u32 NUM_STORAGE_BUFFERS = Shader::Info::MAX_SSBOS;
-static_assert(NUM_STORAGE_BUFFERS <= 32, "storage binding masks must fit u32");
+// Native compute shaders bind up to 18 global memory ranges; the enable masks are 32 bits wide.
+constexpr u32 NUM_STORAGE_BUFFERS = 32;
+// Compute programs can take pointer table entries beyond 32 bindings (Shader::Info::MAX_SSBOS).
+constexpr u32 NUM_COMPUTE_STORAGE_BUFFERS = 64;
 constexpr u32 NUM_TEXTURE_BUFFERS = 32;
 constexpr u32 NUM_STAGES = 5;
 
@@ -144,7 +144,7 @@ public:
     Binding indirect_buffer_binding;
 
     std::array<Binding, NUM_COMPUTE_UNIFORM_BUFFERS> compute_uniform_buffers;
-    std::array<Binding, NUM_STORAGE_BUFFERS> compute_storage_buffers;
+    std::array<Binding, NUM_COMPUTE_STORAGE_BUFFERS> compute_storage_buffers;
     std::array<TextureBufferBinding, NUM_TEXTURE_BUFFERS> compute_texture_buffers;
 
     std::array<u32, NUM_STAGES> enabled_uniform_buffer_masks{};
@@ -155,8 +155,8 @@ public:
 
     std::array<u32, NUM_STAGES> enabled_storage_buffers{};
     std::array<u32, NUM_STAGES> written_storage_buffers{};
-    u32 enabled_compute_storage_buffers = 0;
-    u32 written_compute_storage_buffers = 0;
+    u64 enabled_compute_storage_buffers = 0;
+    u64 written_compute_storage_buffers = 0;
 
     u32 total_graphics_storage_buffers = 0;
     u32 total_compute_storage_buffers = 0;
@@ -413,7 +413,8 @@ public:
             }
             const Buffer* host = nullptr;
             u32 offset = 0;
-            if (const BufferId id = page_table[binding.device_addr >> CACHING_PAGEBITS]) {
+            const u64 page = binding.device_addr >> CACHING_PAGEBITS;
+            if (const BufferId id = page < page_table.size() ? page_table[page] : BufferId{}) {
                 const Buffer& buffer = slot_buffers[id];
                 if (buffer.IsInBounds(binding.device_addr, size)) {
                     host = &buffer;
@@ -427,12 +428,13 @@ public:
             ForEachEnabledBit(channel_state->enabled_compute_uniform_buffer_mask, [&](u32 index) {
                 const Binding& binding = channel_state->compute_uniform_buffers[index];
                 visit(5, false, index, false, binding,
-                      sizes ? std::min(binding.size, (*sizes)[index]) : binding.size);
+                      sizes ? (std::min)(binding.size, (*sizes)[index]) : binding.size);
             });
             ForEachEnabledBit(channel_state->enabled_compute_storage_buffers, [&](u32 index) {
                 const Binding& binding = channel_state->compute_storage_buffers[index];
-                visit(5, true, index, ((channel_state->written_compute_storage_buffers >> index) & 1) != 0,
-                      binding, binding.size);
+                visit(5, true, index,
+                      ((channel_state->written_compute_storage_buffers >> index) & 1) != 0, binding,
+                      binding.size);
             });
             return;
         }
@@ -441,7 +443,7 @@ public:
             ForEachEnabledBit(channel_state->enabled_uniform_buffer_masks[stage], [&](u32 index) {
                 const Binding& binding = channel_state->uniform_buffers[stage][index];
                 visit(stage, false, index, false, binding,
-                      sizes ? std::min(binding.size, (*sizes)[stage][index]) : binding.size);
+                      sizes ? (std::min)(binding.size, (*sizes)[stage][index]) : binding.size);
             });
             ForEachEnabledBit(channel_state->enabled_storage_buffers[stage], [&](u32 index) {
                 const Binding& binding = channel_state->storage_buffers[stage][index];
@@ -482,8 +484,8 @@ public:
     std::unordered_set<DAddr> native_indirect_uniforms_this_frame;
 
 private:
-    template <typename Func>
-    static void ForEachEnabledBit(u32 enabled_mask, Func&& func) {
+    template <typename Mask, typename Func>
+    static void ForEachEnabledBit(Mask enabled_mask, Func&& func) {
         for (u32 index = 0; enabled_mask != 0; ++index, enabled_mask >>= 1) {
             const int disabled_bits = std::countr_zero(enabled_mask);
             index += disabled_bits;
@@ -709,41 +711,51 @@ private:
         return AsyncBufferDownloads() || memory_tracker.IsRegionPreflushable(device_addr, size);
     }
 
-    /// Queues a GPU write for download at the next fence where DownloadsAtFence holds. With only
-    /// Preflushable marks, just the marked pages are queued: a write that covers one marked page
-    /// of a large buffer would otherwise copy the whole buffer back at every fence.
-    void QueueFenceDownload(DAddr device_addr, u64 size) {
-        static const bool exact = [] {
-            const char* value = std::getenv("EDEN_NX2_EXACT_PREFLUSH");
-            return value == nullptr || value[0] != '0';
-        }();
+    /// Whether the range holds GPU-written data that no fence downloads (not Preflushable).
+    bool HasGpuWritesNotDownloadedAtFence(DAddr device_addr, u64 size) {
+        if (AsyncBufferDownloads()) {
+            return false;
+        }
+        bool found = false;
+        memory_tracker.ForEachDownloadRange(device_addr, size, false, [&](u64 start, u64 range_size) {
+            if (found) {
+                return;
+            }
+            u64 covered = 0;
+            memory_tracker.ForEachPreflushableRange(start, range_size, [&](u64 lower, u64 length) {
+                const u64 begin = (std::max)(lower, start);
+                const u64 end = (std::min)(lower + length, start + range_size);
+                covered += end > begin ? end - begin : 0;
+            });
+            found = covered < range_size;
+        });
+        return found;
+    }
+
+    /// A GPU write: queues its Preflushable parts for download at the next fence and traps reads
+    /// of the rest. Queuing the whole range when any page of it was Preflushable copied whole
+    /// written storage buffers (up to 8 MiB) back at every fence: ~5 GB/s in title 1's forest.
+    void QueueGpuWrite(DAddr device_addr, u64 size) {
         if (AsyncBufferDownloads()) {
             uncommitted_gpu_modified_ranges.Add(device_addr, size);
             return;
         }
-        if (!exact) {
-            if (memory_tracker.IsRegionPreflushable(device_addr, size)) {
-                uncommitted_gpu_modified_ranges.Add(device_addr, size);
-            } else {
-                ArmReadTraps(device_addr, size);
-            }
-            return;
-        }
         const DAddr end = device_addr + size;
-        u64 queued = 0;
-        memory_tracker.ForEachPreflushableRange(device_addr, size, [&](DAddr begin, u64 length) {
-            const DAddr lower = (std::max)(begin, device_addr);
-            const DAddr upper = (std::min)(begin + length, end);
-            if (lower < upper) {
-                uncommitted_gpu_modified_ranges.Add(lower, upper - lower);
-                queued += upper - lower;
+        DAddr cursor = device_addr;
+        memory_tracker.ForEachPreflushableRange(device_addr, size, [&](DAddr start, u64 range_size) {
+            const DAddr lower = (std::max)(start, cursor);
+            const DAddr upper = (std::min)(start + range_size, end);
+            if (lower >= upper) {
+                return;
             }
+            if (lower > cursor) {
+                ArmReadTraps(cursor, lower - cursor);
+            }
+            uncommitted_gpu_modified_ranges.Add(lower, upper - lower);
+            cursor = upper;
         });
-        if (queued < size) {
-            ArmReadTraps(device_addr, size);
-        }
-        if (Nx2DownloadTrace::g_enabled && queued != 0) [[unlikely]] {
-            Nx2DownloadTrace::Queued(device_addr, size, queued);
+        if (cursor < end) {
+            ArmReadTraps(cursor, end - cursor);
         }
     }
 

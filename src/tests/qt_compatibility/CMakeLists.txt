@@ -23,5 +23,20 @@ target_compile_definitions(compatibility_report_tests PRIVATE
 )
 target_include_directories(compatibility_report_tests PRIVATE ../..)
 target_link_libraries(compatibility_report_tests PRIVATE Qt6::Widgets Qt6::Network Qt6::Test)
+if(WIN32)
+    add_custom_command(TARGET compatibility_report_tests POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_RUNTIME_DLLS:compatibility_report_tests>
+            $<TARGET_FILE_DIR:compatibility_report_tests>
+        COMMAND_EXPAND_LISTS)
+    if(TARGET Qt6::QOffscreenIntegrationPlugin)
+        add_custom_command(TARGET compatibility_report_tests POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E make_directory
+                "$<TARGET_FILE_DIR:compatibility_report_tests>/plugins/platforms"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_FILE:Qt6::QOffscreenIntegrationPlugin>
+                "$<TARGET_FILE_DIR:compatibility_report_tests>/plugins/platforms")
+    endif()
+endif()
 add_test(NAME compatibility_report COMMAND compatibility_report_tests)
 set_tests_properties(compatibility_report PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")

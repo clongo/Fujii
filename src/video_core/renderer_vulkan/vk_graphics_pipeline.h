@@ -190,6 +190,7 @@ public:
     }
 
 private:
+
     template <typename Spec>
     bool ConfigureImpl(bool is_indexed);
 

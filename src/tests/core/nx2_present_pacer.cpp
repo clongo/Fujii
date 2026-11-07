@@ -70,6 +70,16 @@ TEST_CASE("NX2 late period changes reanchor using the current period", "[core][n
     REQUIRE(next.deadline == late.deadline + OneVblank);
 }
 
+TEST_CASE("NX2 unpaced movie presents reanchor the next paced frame", "[core][nx2_present_pacer]") {
+    Pacer pacer;
+    pacer.Advance(Start, OneVblank);
+    pacer.Reset();
+    const auto next = pacer.Advance(Start + 1s, OneVblank);
+    REQUIRE(next.reset);
+    REQUIRE(next.deadline == Start + 1s);
+    REQUIRE(pacer.Advance(Start + 1s, OneVblank).deadline == Start + 1s + OneVblank);
+}
+
 TEST_CASE("NX2 fixed-period pacing matches the previous algorithm", "[core][nx2_present_pacer]") {
     for (const auto period : {OneVblank, TwoVblanks, std::chrono::nanoseconds{ThreeVblanks}}) {
         Pacer pacer;

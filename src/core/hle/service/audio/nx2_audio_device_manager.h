@@ -7,6 +7,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -17,6 +18,7 @@
 
 #include <fmt/ranges.h>
 
+#include "audio_core/audio_core.h"
 #include "common/string_util.h"
 #include "audio_core/audio_core.h"
 #include "core/core.h"
@@ -30,6 +32,7 @@
 #include "core/hle/service/ipc_helpers.h"
 #include "core/hle/service/kernel_helpers.h"
 #include "core/hle/service/service.h"
+#include "core/memory.h"
 
 namespace Service::Audio {
 
@@ -87,9 +90,10 @@ struct Nx2SysmixStreams {
     std::shared_ptr<Core::Timing::EventType> timer;
 };
 
-// Switch 2 virtual output devices (nn::audio::ListVirtualOutputDevices and friends), reached through
-// the object auddmg:u command 0 returns. Eden plays everything through one stereo 48 kHz output, so
-// there is one virtual device. The nx2: name keeps the other commands auto-stubbed and logged.
+// Switch 2 virtual output devices (nn::audio::ListVirtualOutputDevices and friends), reached
+// through the object auddmg:u command 0 returns. Eden plays everything through one stereo 48 kHz
+// output, so there is one virtual device. The nx2: name keeps the other commands auto-stubbed and
+// logged.
 // - 0(u32): u32 count, the device names in the out buffer (0x100 bytes each).
 // - 100(u32): the default device's name in the out buffer.
 // - 300(16-byte stream format, name buffer): whether the format is supported (result only).
@@ -343,6 +347,7 @@ private:
     }
 
     void GetStreamGain(HLERequestContext& ctx) {
+        std::scoped_lock lk{streams->mutex};
         IPC::ResponseBuilder rb{ctx, 3};
         rb.Push(ResultSuccess);
         rb.Push(stream->GetGain());
