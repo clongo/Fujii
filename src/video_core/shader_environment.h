@@ -99,8 +99,8 @@ public:
     void Dump(u64 pipeline_hash, u64 shader_hash) override;
 
     /// with_mesh_state: also the mesh registers and pass-through header of task and mesh
-    /// programs (only the mesh pipeline file carries them).
-    void Serialize(std::ofstream& file, bool with_mesh_state = false) const;
+    /// programs. Existing fork cache versions carry these fields in the main file too.
+    void Serialize(std::ofstream& file, bool with_mesh_state = true) const;
 
     /// Native programs: the constant buffer slots (index << 32 | offset) storage tracking took as
     /// pointers, and the ones it left out because they held null when the program was translated.
@@ -233,7 +233,7 @@ public:
     FileEnvironment& operator=(const FileEnvironment&) = delete;
     FileEnvironment(const FileEnvironment&) = delete;
 
-    void Deserialize(std::ifstream& file, bool with_mesh_state = false);
+    void Deserialize(std::ifstream& file, bool with_mesh_state = true);
 
     /// See GenericEnvironment::StoragePointerSlots.
     void StoragePointerSlots(std::vector<u64>& pointers, std::vector<u64>& null_slots) const;
@@ -298,13 +298,13 @@ private:
 
 void SerializePipeline(std::span<const char> key, std::span<const GenericEnvironment* const> envs,
                        const std::filesystem::path& filename, u32 cache_version,
-                       bool with_mesh_state = false);
+                       bool with_mesh_state = true);
 
 template <typename Key, typename Envs>
     requires std::is_trivially_copyable_v<Key>
         && std::has_unique_object_representations_v<Key>
 void SerializePipeline(const Key& key, const Envs& envs, const std::filesystem::path& filename, u32 cache_version,
-                       bool with_mesh_state = false) {
+                       bool with_mesh_state = true) {
     SerializePipeline(std::span(reinterpret_cast<const char*>(&key), sizeof(key)), std::span(envs.data(), envs.size()), filename, cache_version,
                       with_mesh_state);
 }
@@ -312,7 +312,7 @@ void SerializePipeline(const Key& key, const Envs& envs, const std::filesystem::
 void LoadPipelines(std::stop_token stop_loading, const std::filesystem::path& filename, u32 expected_cache_version,
     Common::UniqueFunction<void, std::ifstream&, FileEnvironment> load_compute,
     Common::UniqueFunction<void, std::ifstream&, std::vector<FileEnvironment>> load_graphics,
-    bool with_mesh_state = false);
+    bool with_mesh_state = true);
 
 /// Rewrites the pipeline cache at `source`, whose header must carry `source_version`, to
 /// `destination` with `destination_version`. Each graphics record's key is passed to

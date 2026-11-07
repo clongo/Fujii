@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "yuzu/compatibility_report.h"
+#include "yuzu/migration_dialog.h"
 
 #include <algorithm>
 #include <cstring>
@@ -104,6 +105,32 @@ public:
     static int Preview(QApplication& app, const QString& screenshot = {});
 
 private slots:
+    void migrationDialogCancellation() {
+        MigrationDialog dialog;
+        dialog.addButton(QStringLiteral("Migrate"));
+        dialog.addButton(QStringLiteral("No"), true);
+        QVERIFY(dialog.clickedButton() == nullptr);
+        dialog.reject();
+        QCOMPARE(dialog.result(), int(QDialog::Rejected));
+        QVERIFY(dialog.clickedButton() == nullptr);
+    }
+
+    void migrationDialogSelection() {
+        MigrationDialog dialog;
+        auto* button = dialog.addButton(QStringLiteral("Migrate"));
+        QTest::mouseClick(button, Qt::LeftButton);
+        QCOMPARE(dialog.result(), int(QDialog::Accepted));
+        QCOMPARE(dialog.clickedButton(), button);
+    }
+
+    void migrationDialogNoButton() {
+        MigrationDialog dialog;
+        auto* button = dialog.addButton(QStringLiteral("No"), true);
+        QTest::mouseClick(button, Qt::LeftButton);
+        QCOMPARE(dialog.result(), int(QDialog::Rejected));
+        QCOMPARE(dialog.clickedButton(), button);
+    }
+
     void noImplicitTraffic();
     void explicitCatalogAndPaging();
     void consentAndDoubleSubmit();

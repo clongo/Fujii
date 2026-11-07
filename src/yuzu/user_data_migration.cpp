@@ -103,7 +103,7 @@ void UserDataMigrator::ShowMigrationPrompt(QMainWindow* main_window) {
 
     QAbstractButton* button = migration_prompt.clickedButton();
 
-    if (button->text() == QObject::tr("No")) {
+    if (!button || migration_prompt.result() == QDialog::Rejected) {
         return ShowMigrationCancelledMessage(main_window);
     }
 

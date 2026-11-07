@@ -275,6 +275,11 @@ try {
 the required Windows runtime. Bundled dependency self-tests are not part of the
 emulator's test suite.
 
+Startup regression coverage includes closing the migration dialog without selecting
+a button and loading older fork shader caches containing task/mesh records. Keep
+the task/mesh serialization fields enabled for the existing fork cache versions;
+omitting them without a version change misaligns subsequent records.
+
 The default is `Release`, 12 jobs, and no tests, matching the Windows release
 configuration apart from release publishing metadata. The
 [build script](../tools/docker/windows/build.ps1) also accepts `-SourceDir` and

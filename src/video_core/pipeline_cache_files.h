@@ -18,6 +18,9 @@ namespace VideoCommon {
 inline constexpr u32 OpenGLPipelineCacheVersion = 48;
 inline constexpr u32 VulkanPipelineCacheVersion = 54;
 
+// These fork cache versions already include task/mesh state in the main shader file.
+// Keep that serialization layout when reading old files, including during migration.
+
 /// Earlier versions whose driver pipeline cache (vulkan_pipelines) is copied forward, newest
 /// first. From version 54 graphics keys mask the vertex attribute types a program doesn't read,
 /// so the version 53 shader cache is not copied but rewritten with remasked keys

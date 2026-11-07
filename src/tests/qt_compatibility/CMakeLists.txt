@@ -11,6 +11,8 @@ add_executable(compatibility_report_tests
     compatibility_report.cpp
     ../../yuzu/compatibility_report.cpp
     ../../yuzu/compatibility_report.h
+    ../../yuzu/migration_dialog.cpp
+    ../../yuzu/migration_dialog.h
 )
 target_compile_features(compatibility_report_tests PRIVATE cxx_std_20)
 target_compile_definitions(compatibility_report_tests PRIVATE

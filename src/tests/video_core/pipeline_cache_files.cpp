@@ -89,6 +89,7 @@ TEST_CASE("Task and mesh disk environments roundtrip all translation state and r
     for (const auto stage : {Shader::Stage::Task, Shader::Stage::Mesh, Shader::Stage::Fragment}) {
         SerializedEnvironment source{stage};
         const std::array<const VideoCommon::GenericEnvironment*, 1> envs{&source};
+        // Older fork files always carried mesh state, even in the main shader cache.
         VideoCommon::SerializePipeline(key, envs, path, VideoCommon::VulkanPipelineCacheVersion,
                                        true);
     }
@@ -118,8 +119,49 @@ TEST_CASE("Task and mesh disk environments roundtrip all translation state and r
             u64 restored_key{};
             file.read(reinterpret_cast<char*>(&restored_key), sizeof(restored_key));
             REQUIRE(restored_key == key);
-        }, true);
+        });
     REQUIRE(read == 3);
+}
+
+TEST_CASE("Malformed pipeline cache counts are rejected before allocation",
+          "[pipeline_cache_files][mesh_serialization]") {
+    TempDir temp;
+    const auto path = temp.path / "invalid-counts.bin";
+    SerializedEnvironment source{Shader::Stage::Fragment};
+    const std::array<const VideoCommon::GenericEnvironment*, 1> envs{&source};
+    constexpr u64 key = 42;
+    VideoCommon::SerializePipeline(key, envs, path, VideoCommon::VulkanPipelineCacheVersion);
+    SECTION("Empty environment list") {
+        std::fstream file(path, std::ios::binary | std::ios::in | std::ios::out);
+        const u32 count = 0;
+        file.seekp(12);
+        file.write(reinterpret_cast<const char*>(&count), sizeof(count));
+    }
+    SECTION("Oversized environment list") {
+        std::fstream file(path, std::ios::binary | std::ios::in | std::ios::out);
+        const u32 count = 0xffffffff;
+        file.seekp(12);
+        file.write(reinterpret_cast<const char*>(&count), sizeof(count));
+    }
+    SECTION("Oversized shader code") {
+        std::fstream file(path, std::ios::binary | std::ios::in | std::ios::out);
+        const u64 count = 0xffffffffffffffff;
+        file.seekp(16);
+        file.write(reinterpret_cast<const char*>(&count), sizeof(count));
+    }
+    SECTION("Oversized constant buffer map") {
+        std::fstream file(path, std::ios::binary | std::ios::in | std::ios::out);
+        const u64 count = 0xffffffffffffffff;
+        file.seekp(16 + 3 * sizeof(u64));
+        file.write(reinterpret_cast<const char*>(&count), sizeof(count));
+    }
+    REQUIRE_NOTHROW(VideoCommon::LoadPipelines(
+        {}, path, VideoCommon::VulkanPipelineCacheVersion,
+        [](std::ifstream&, VideoCommon::FileEnvironment) { FAIL("Invalid compute record"); },
+        [](std::ifstream&, std::vector<VideoCommon::FileEnvironment>) {
+            FAIL("Invalid graphics record");
+        }));
+    REQUIRE_FALSE(std::filesystem::exists(path));
 }
 
 TEST_CASE("Compatible v52 pipelines migrate without changing or discarding the old warm cache",
@@ -155,6 +197,40 @@ TEST_CASE("Compatible v52 pipelines migrate without changing or discarding the o
     const auto other = temp.path / "wrong.bin";
     REQUIRE_FALSE(VideoCommon::CopyCompatiblePipelineCache(old, other, Magic, 51, 53));
     REQUIRE_FALSE(std::filesystem::exists(other));
+}
+
+TEST_CASE("Version 53 migration preserves task and mesh record boundaries",
+          "[pipeline_cache_files][mesh_serialization]") {
+    TempDir temp;
+    const auto source = temp.path / "v53.bin";
+    const auto destination = temp.path / "v54.bin";
+    constexpr u64 key = 42;
+    for (const auto stage : {Shader::Stage::Task, Shader::Stage::Mesh, Shader::Stage::Fragment}) {
+        SerializedEnvironment env{stage};
+        const std::array<const VideoCommon::GenericEnvironment*, 1> envs{&env};
+        VideoCommon::SerializePipeline(key, envs, source, 53, true);
+    }
+    const auto before = ReadAll(source);
+    REQUIRE(VideoCommon::MigratePipelines(
+        {}, source, 53, destination, 54, sizeof(key), sizeof(key),
+        [](std::span<char>, std::span<const VideoCommon::FileEnvironment>) { return true; }));
+    CHECK(ReadAll(source) == before);
+    CHECK(ReadAll(destination).substr(12) == before.substr(12));
+    size_t loaded = 0;
+    VideoCommon::LoadPipelines(
+        {}, destination, 54,
+        [](std::ifstream&, VideoCommon::FileEnvironment) { FAIL("Unexpected compute record"); },
+        [&](std::ifstream& file, std::vector<VideoCommon::FileEnvironment> envs) {
+            REQUIRE(envs.size() == 1);
+            const std::array stages{Shader::Stage::Task, Shader::Stage::Mesh,
+                                    Shader::Stage::Fragment};
+            REQUIRE(loaded < stages.size());
+            CHECK(envs.front().ShaderStage() == stages[loaded++]);
+            u64 restored{};
+            file.read(reinterpret_cast<char*>(&restored), sizeof(restored));
+            CHECK(restored == key);
+        });
+    CHECK(loaded == 3);
 }
 
 TEST_CASE("Compatible pipeline cache migration retries after an interrupted temporary copy",

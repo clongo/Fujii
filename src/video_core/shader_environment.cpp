@@ -1135,6 +1135,37 @@ void FileEnvironment::Deserialize(std::ifstream& file, bool with_mesh_state) {
         .read(reinterpret_cast<char*>(&read_highest), sizeof(read_highest))
         .read(reinterpret_cast<char*>(&viewport_transform_state), sizeof(viewport_transform_state))
         .read(reinterpret_cast<char*>(&stage), sizeof(stage));
+    const auto payload_begin = file.tellg();
+    file.seekg(0, std::ios::end);
+    const auto payload_end = file.tellg();
+    file.seekg(payload_begin);
+    if (payload_end < payload_begin || stage > Shader::Stage::Mesh) {
+        throw std::ios_base::failure("Invalid pipeline cache environment");
+    }
+    u64 remaining = static_cast<u64>(payload_end - payload_begin);
+    const auto consume = [&remaining](u64 count, u64 element_size) {
+        if (count > remaining / element_size) {
+            throw std::ios_base::failure("Pipeline cache environment exceeds file size");
+        }
+        remaining -= count * element_size;
+    };
+    consume(code_size, 1);
+    consume(num_texture_types, sizeof(u32) + sizeof(Shader::TextureType));
+    consume(num_texture_pixel_formats, sizeof(u32) + sizeof(Shader::TexturePixelFormat));
+    consume(num_cbuf_values, sizeof(u64) + sizeof(u32));
+    consume(num_storage_pointer_types, sizeof(u64) + sizeof(u8));
+    consume(num_cbuf_replacement_values, sizeof(u64) + sizeof(Shader::ReplaceConstant));
+    if (stage == Shader::Stage::Compute) {
+        consume(1, sizeof(workgroup_size) + sizeof(shared_memory_size));
+    } else {
+        consume(1, sizeof(sph));
+        if (stage == Shader::Stage::Geometry) {
+            consume(1, sizeof(gp_passthrough_mask));
+        }
+        if (with_mesh_state && (stage == Shader::Stage::Task || stage == Shader::Stage::Mesh)) {
+            consume(1, sizeof(mesh_registers) + sizeof(mesh_primitive_header));
+        }
+    }
     code.resize(Common::DivCeil(code_size, sizeof(u64)));
     file.read(reinterpret_cast<char*>(code.data()), code_size);
     for (size_t i = 0; i < num_texture_types; ++i) {
@@ -1371,6 +1402,9 @@ void LoadPipelines(
         }
         u32 num_envs{};
         file.read(reinterpret_cast<char*>(&num_envs), sizeof(num_envs));
+        if (num_envs == 0 || num_envs > Maxwell::MaxShaderProgram) {
+            throw std::ios_base::failure("Invalid pipeline cache environment count");
+        }
         std::vector<FileEnvironment> envs(num_envs);
         for (FileEnvironment& env : envs) {
             env.Deserialize(file, with_mesh_state);
@@ -1436,10 +1470,8 @@ bool MigratePipelines(
             }
             u32 num_envs{};
             file.read(reinterpret_cast<char*>(&num_envs), sizeof(num_envs));
-            if (num_envs == 0) {
-                out.close();
-                std::filesystem::remove(temporary, error);
-                return false;
+            if (num_envs == 0 || num_envs > Maxwell::MaxShaderProgram) {
+                throw std::ios_base::failure("Invalid pipeline cache environment count");
             }
             const std::streampos envs_begin{file.tellg()};
             std::vector<FileEnvironment> envs(num_envs);
