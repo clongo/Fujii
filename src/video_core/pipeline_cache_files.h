@@ -19,8 +19,10 @@ inline constexpr u32 OpenGLPipelineCacheVersion = 48;
 inline constexpr u32 VulkanPipelineCacheVersion = 54;
 
 /// Earlier versions whose driver pipeline cache (vulkan_pipelines) is copied forward, newest
-/// first. Their shader caches are not: from version 54 graphics keys mask the vertex attribute
-/// types a program doesn't read, so an older key is never looked up again.
+/// first. From version 54 graphics keys mask the vertex attribute types a program doesn't read,
+/// so the version 53 shader cache is not copied but rewritten with remasked keys
+/// (MigrateV53ShaderCache in vk_pipeline_cache.cpp); version 52's shader cache is not carried
+/// forward.
 inline constexpr std::array<u32, 2> VulkanDriverCacheMigrationSources{53, 52};
 
 // Official Eglantine (cache version 18 at c0cb3325) and this fork (a different version) both

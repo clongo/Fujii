@@ -8,6 +8,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <cstring>
 #include <fstream>
 #include <functional>
 #include <iostream>
@@ -727,6 +728,109 @@ bool PreloadAllPipelines() {
     }();
     return all;
 }
+
+/// Generic vertex attributes a cached program reads, as the shader cache computes it for live
+/// programs (ComputeShaderInfo in shader_cache.cpp): a native vertex program's header input map,
+/// none for task and mesh programs, every attribute for anything else.
+u64 FileVertexAttributeMask(const VideoCommon::FileEnvironment& env) {
+    switch (env.ShaderStage()) {
+    case Shader::Stage::VertexB:
+        if (env.IsNativeProgram()) {
+            std::array<std::array<bool, 4>, Maxwell::NumVertexAttributes> input_generic{};
+            for (size_t index = 0; index < input_generic.size(); ++index) {
+                input_generic[index] = env.SPH().vtg.InputGeneric(index);
+            }
+            return VideoCommon::VertexAttributeMask(input_generic);
+        }
+        return ~u64{0};
+    case Shader::Stage::Task:
+    case Shader::Stage::Mesh:
+        return 0;
+    default:
+        return ~u64{0};
+    }
+}
+
+/// From version 54, a graphics key's attribute_types keeps only the vertex attributes its
+/// programs read (pipeline_cache_policy.h); nothing else changed in version 53's format. On the
+/// first boot after the bump, rewrite the version 53 shader cache as version 54 with remasked
+/// keys and carry the used-pipeline list across through the changed hashes, so neither is built
+/// again from scratch. The version 53 files are left in place for older builds.
+void MigrateV53ShaderCache(const std::filesystem::path& base_dir,
+                           const std::filesystem::path& destination,
+                           const std::filesystem::path& used_destination,
+                           std::stop_token stop_loading) {
+    constexpr u32 SourceVersion = 53;
+    static_assert(VideoCommon::VulkanPipelineCacheVersion == SourceVersion + 1,
+                  "The version 53 migration only knows how 54 changed the keys");
+    const auto source = VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan", SourceVersion);
+    std::unordered_map<u64, u64> migrated_hashes;
+    std::unordered_set<u64> emitted_hashes;
+    const auto fix_graphics_key = [&migrated_hashes, &emitted_hashes](
+                                      std::span<char> key_bytes,
+                                      std::span<const VideoCommon::FileEnvironment> envs) {
+        if (key_bytes.size() != sizeof(GraphicsPipelineCacheKey)) {
+            return true;
+        }
+        GraphicsPipelineCacheKey key;
+        std::memcpy(&key, key_bytes.data(), sizeof(key));
+        const u64 source_hash = key.Hash();
+        if (key.state.dynamic_vertex_input != 0) {
+            std::array<u64, Maxwell::MaxShaderProgram> attribute_masks{};
+            size_t env_index = 0;
+            for (size_t stage = 0; stage < attribute_masks.size(); ++stage) {
+                if (key.unique_hashes[stage] == 0) {
+                    continue;
+                }
+                if (env_index >= envs.size()) {
+                    return true;
+                }
+                attribute_masks[stage] = FileVertexAttributeMask(envs[env_index++]);
+            }
+            key.state.attribute_types = VideoCommon::KeyedAttributeTypes(
+                key.state.attribute_types, key.unique_hashes, attribute_masks);
+            std::memcpy(key_bytes.data(), &key, sizeof(key));
+        }
+        migrated_hashes.emplace(source_hash, key.Hash());
+        // Source keys that collapse into one remasked key keep only their first record.
+        return emitted_hashes.insert(key.Hash()).second;
+    };
+    if (!VideoCommon::MigratePipelines(stop_loading, source, SourceVersion, destination,
+                                       VideoCommon::VulkanPipelineCacheVersion,
+                                       sizeof(ComputePipelineCacheKey),
+                                       sizeof(GraphicsPipelineCacheKey), fix_graphics_key)) {
+        return;
+    }
+    size_t used_count = 0;
+    std::error_code error;
+    if (!std::filesystem::exists(used_destination, error) && !error) {
+        const auto used_source =
+            VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan_used", SourceVersion);
+        std::unordered_map<u64, u8> used;
+        for (const auto& [hash, age] : LoadUsedPipelines(used_source, UsedPipelinesMaxAge)) {
+            if (const auto it = migrated_hashes.find(hash); it != migrated_hashes.end()) {
+                used.emplace(it->second, age);
+            }
+        }
+        if (!used.empty()) {
+            std::ofstream file{used_destination, std::ios::binary | std::ios::trunc};
+            const u32 count = static_cast<u32>(used.size());
+            file.write(reinterpret_cast<const char*>(&UsedPipelinesMagic),
+                       sizeof(UsedPipelinesMagic));
+            file.write(reinterpret_cast<const char*>(&count), sizeof(count));
+            for (const auto& [hash, age] : used) {
+                file.write(reinterpret_cast<const char*>(&hash), sizeof(hash));
+                file.write(reinterpret_cast<const char*>(&age), sizeof(age));
+            }
+            used_count = used.size();
+        }
+    }
+    LOG_INFO(Render_Vulkan,
+             "Migrated the version {} shader cache to version {}: {} graphics keys kept of {}, "
+             "{} on the used list",
+             SourceVersion, VideoCommon::VulkanPipelineCacheVersion, emitted_hashes.size(),
+             migrated_hashes.size(), used_count);
+}
 } // Anonymous namespace
 
 PipelineCache::~PipelineCache() {
@@ -869,6 +973,8 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan", CACHE_VERSION);
     used_pipelines_filename =
         VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan_used", CACHE_VERSION);
+    MigrateV53ShaderCache(base_dir, pipeline_cache_filename, used_pipelines_filename,
+                          stop_loading);
     used_pipelines = LoadUsedPipelines(used_pipelines_filename, MaxUsedPipelineAge(device));
     used_pipelines_saved = std::chrono::steady_clock::now();
     size_t skipped_pipelines = 0;
