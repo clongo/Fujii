@@ -223,6 +223,89 @@ TEST_CASE("Cancelled mesh loading preserves its disk cache and queues no work",
     REQUIRE(ReadAll(path) == before);
 }
 
+TEST_CASE("Driver cache migration sources are older versions, newest first",
+          "[pipeline_cache_files][attribute_keys]") {
+    constexpr auto& sources = VideoCommon::VulkanDriverCacheMigrationSources;
+    REQUIRE_FALSE(sources.empty());
+    for (size_t index = 0; index < sources.size(); ++index) {
+        CHECK(sources[index] < VideoCommon::VulkanPipelineCacheVersion);
+        if (index != 0) {
+            CHECK(sources[index] < sources[index - 1]);
+        }
+    }
+}
+
+TEST_CASE("The newest compatible driver cache is copied forward and the others are left alone",
+          "[pipeline_cache_files][attribute_keys]") {
+    TempDir temp;
+    const auto v52 = VideoCommon::VersionedPipelineCachePath(temp.path, "vulkan_pipelines", 52);
+    const auto v53 = VideoCommon::VersionedPipelineCachePath(temp.path, "vulkan_pipelines", 53);
+    const auto current = VideoCommon::VersionedPipelineCachePath(
+        temp.path, "vulkan_pipelines", VideoCommon::VulkanPipelineCacheVersion);
+    WriteCache(v52, OtherMagic, 52, "driver blob 52");
+    WriteCache(v53, OtherMagic, 53, "driver blob 53");
+    const auto before52 = ReadAll(v52);
+    const auto before53 = ReadAll(v53);
+
+    const auto copied = VideoCommon::CopyNewestCompatiblePipelineCache(
+        temp.path, "vulkan_pipelines", current, OtherMagic,
+        VideoCommon::VulkanDriverCacheMigrationSources, VideoCommon::VulkanPipelineCacheVersion);
+    REQUIRE(copied == 53u);
+    CHECK(VideoCommon::PipelineCacheHeaderMatches(current, OtherMagic,
+                                                  VideoCommon::VulkanPipelineCacheVersion));
+    CHECK(ReadAll(current).substr(12) == "driver blob 53");
+    CHECK(ReadAll(v52) == before52);
+    CHECK(ReadAll(v53) == before53);
+
+    // An existing current cache is never replaced.
+    CHECK_FALSE(VideoCommon::CopyNewestCompatiblePipelineCache(
+                    temp.path, "vulkan_pipelines", current, OtherMagic,
+                    VideoCommon::VulkanDriverCacheMigrationSources,
+                    VideoCommon::VulkanPipelineCacheVersion)
+                    .has_value());
+    CHECK(ReadAll(current).substr(12) == "driver blob 53");
+}
+
+TEST_CASE("Driver cache migration falls back to an older version when the newest is unusable",
+          "[pipeline_cache_files][attribute_keys]") {
+    TempDir temp;
+    const auto v52 = VideoCommon::VersionedPipelineCachePath(temp.path, "vulkan_pipelines", 52);
+    const auto v53 = VideoCommon::VersionedPipelineCachePath(temp.path, "vulkan_pipelines", 53);
+    const auto current = VideoCommon::VersionedPipelineCachePath(
+        temp.path, "vulkan_pipelines", VideoCommon::VulkanPipelineCacheVersion);
+    WriteCache(v52, OtherMagic, 52, "driver blob 52");
+
+    SECTION("newest missing") {}
+    SECTION("newest has the wrong magic") {
+        WriteCache(v53, Magic, 53, "shader cache");
+    }
+    SECTION("newest was written by another version") {
+        WriteCache(v53, OtherMagic, 50, "mislabelled");
+    }
+    const auto copied = VideoCommon::CopyNewestCompatiblePipelineCache(
+        temp.path, "vulkan_pipelines", current, OtherMagic,
+        VideoCommon::VulkanDriverCacheMigrationSources, VideoCommon::VulkanPipelineCacheVersion);
+    REQUIRE(copied == 52u);
+    CHECK(ReadAll(current).substr(12) == "driver blob 52");
+}
+
+TEST_CASE("Driver cache migration copies nothing without a compatible source",
+          "[pipeline_cache_files][attribute_keys]") {
+    TempDir temp;
+    const auto current = VideoCommon::VersionedPipelineCachePath(
+        temp.path, "vulkan_pipelines", VideoCommon::VulkanPipelineCacheVersion);
+    CHECK_FALSE(VideoCommon::CopyNewestCompatiblePipelineCache(
+                    temp.path, "vulkan_pipelines", current, OtherMagic,
+                    VideoCommon::VulkanDriverCacheMigrationSources,
+                    VideoCommon::VulkanPipelineCacheVersion)
+                    .has_value());
+    CHECK_FALSE(std::filesystem::exists(current));
+    CHECK_FALSE(VideoCommon::CopyNewestCompatiblePipelineCache(
+                    temp.path, "vulkan_pipelines", current, OtherMagic, {},
+                    VideoCommon::VulkanPipelineCacheVersion)
+                    .has_value());
+}
+
 TEST_CASE("Pipeline cache names are version-suffixed per build", "[pipeline_cache_files]") {
     const std::filesystem::path dir{"shader"};
     CHECK(VideoCommon::VersionedPipelineCachePath(dir, "vulkan", 39).filename() ==
@@ -320,4 +403,134 @@ TEST_CASE("Cached compute failures retain their cause and the current dispatch a
     CHECK(entry->second.failure.empty());
     CHECK(entry->second.Get(false, 0x2120633c00, other) == nullptr);
     REQUIRE_THROWS_AS(entry->second.Get(true, 0x2120633c00, other), Shader::RuntimeError);
+}
+
+TEST_CASE("A version 53 shader cache migrates with rewritten graphics keys and intact records",
+          "[pipeline_cache_files][attribute_keys]") {
+    TempDir temp;
+    const auto source = VideoCommon::VersionedPipelineCachePath(temp.path, "vulkan", 53);
+    const auto destination = VideoCommon::VersionedPipelineCachePath(
+        temp.path, "vulkan", VideoCommon::VulkanPipelineCacheVersion);
+
+    const Vulkan::ComputePipelineCacheKey compute_key{
+        .unique_hash = 0x1234,
+        .shared_memory_size = 1024,
+        .workgroup_size = {32, 1, 1},
+    };
+    {
+        SerializedEnvironment env{Shader::Stage::Compute};
+        const std::array<const VideoCommon::GenericEnvironment*, 1> envs{&env};
+        VideoCommon::SerializePipeline(compute_key, envs, source, 53);
+    }
+    Vulkan::GraphicsPipelineCacheKey graphics_key{};
+    graphics_key.unique_hashes = {0, 0xabcd, 0, 0, 0, 0xef01};
+    graphics_key.state.dynamic_vertex_input.Assign(1);
+    graphics_key.state.attribute_types = 0x0f0f;
+    auto duplicate_key = graphics_key;
+    duplicate_key.state.attribute_types = 0x3f3f; // collapses into graphics_key once masked
+    {
+        SerializedEnvironment vertex{Shader::Stage::VertexB};
+        SerializedEnvironment fragment{Shader::Stage::Fragment};
+        const std::array<const VideoCommon::GenericEnvironment*, 2> envs{&vertex, &fragment};
+        VideoCommon::SerializePipeline(graphics_key, envs, source, 53);
+        VideoCommon::SerializePipeline(duplicate_key, envs, source, 53);
+    }
+    const auto before = ReadAll(source);
+
+    auto fixed_key = graphics_key;
+    fixed_key.state.attribute_types = 0x33;
+    size_t graphics_seen = 0;
+    REQUIRE(VideoCommon::MigratePipelines(
+        {}, source, 53, destination, VideoCommon::VulkanPipelineCacheVersion,
+        sizeof(Vulkan::ComputePipelineCacheKey), sizeof(Vulkan::GraphicsPipelineCacheKey),
+        [&](std::span<char> key_bytes, std::span<const VideoCommon::FileEnvironment> envs) {
+            ++graphics_seen;
+            REQUIRE(key_bytes.size() == sizeof(Vulkan::GraphicsPipelineCacheKey));
+            Vulkan::GraphicsPipelineCacheKey key;
+            std::memcpy(&key, key_bytes.data(), sizeof(key));
+            REQUIRE(envs.size() == 2);
+            REQUIRE(envs[0].ShaderStage() == Shader::Stage::VertexB);
+            REQUIRE(envs[1].ShaderStage() == Shader::Stage::Fragment);
+            if (graphics_seen == 1) {
+                REQUIRE(key == graphics_key);
+                std::memcpy(key_bytes.data(), &fixed_key, sizeof(fixed_key));
+                return true;
+            }
+            REQUIRE(key == duplicate_key);
+            return false; // remasked into the first record's key
+        }));
+    REQUIRE(graphics_seen == 2);
+    REQUIRE(ReadAll(source) == before);
+    REQUIRE(VideoCommon::PipelineCacheHeaderMatches(destination, Magic,
+                                                    VideoCommon::VulkanPipelineCacheVersion));
+
+    size_t compute_loaded = 0;
+    size_t graphics_loaded = 0;
+    VideoCommon::LoadPipelines(
+        {}, destination, VideoCommon::VulkanPipelineCacheVersion,
+        [&](std::ifstream& file, VideoCommon::FileEnvironment env) {
+            Vulkan::ComputePipelineCacheKey restored{};
+            file.read(reinterpret_cast<char*>(&restored), sizeof(restored));
+            CHECK(restored == compute_key);
+            CHECK(env.ReadInstruction(0) == 0x123456789abcdef0);
+            ++compute_loaded;
+        },
+        [&](std::ifstream& file, std::vector<VideoCommon::FileEnvironment> envs) {
+            Vulkan::GraphicsPipelineCacheKey restored{};
+            file.read(reinterpret_cast<char*>(&restored), sizeof(restored));
+            CHECK(restored == fixed_key);
+            REQUIRE(envs.size() == 2);
+            CHECK(envs[0].ShaderStage() == Shader::Stage::VertexB);
+            CHECK(envs[1].ShaderStage() == Shader::Stage::Fragment);
+            CHECK(envs[0].ReadCbufValue(1, 16) == 0x1357);
+            ++graphics_loaded;
+        });
+    CHECK(compute_loaded == 1);
+    CHECK(graphics_loaded == 1);
+
+    // An existing destination is never replaced, and another version's file is never migrated.
+    REQUIRE_FALSE(VideoCommon::MigratePipelines(
+        {}, source, 53, destination, VideoCommon::VulkanPipelineCacheVersion,
+        sizeof(Vulkan::ComputePipelineCacheKey), sizeof(Vulkan::GraphicsPipelineCacheKey),
+        [](std::span<char>, std::span<const VideoCommon::FileEnvironment>) { return true; }));
+    const auto wrong_version = temp.path / "wrong-version.bin";
+    REQUIRE_FALSE(VideoCommon::MigratePipelines(
+        {}, source, 52, wrong_version, VideoCommon::VulkanPipelineCacheVersion,
+        sizeof(Vulkan::ComputePipelineCacheKey), sizeof(Vulkan::GraphicsPipelineCacheKey),
+        [](std::span<char>, std::span<const VideoCommon::FileEnvironment>) { return true; }));
+    CHECK_FALSE(std::filesystem::exists(wrong_version));
+    CHECK(ReadAll(source) == before);
+}
+
+TEST_CASE("A cancelled or failed version 53 migration leaves no destination behind",
+          "[pipeline_cache_files][attribute_keys]") {
+    TempDir temp;
+    const auto source = VideoCommon::VersionedPipelineCachePath(temp.path, "vulkan", 53);
+    const auto destination = VideoCommon::VersionedPipelineCachePath(
+        temp.path, "vulkan", VideoCommon::VulkanPipelineCacheVersion);
+    SerializedEnvironment env{Shader::Stage::Fragment};
+    const std::array<const VideoCommon::GenericEnvironment*, 1> envs{&env};
+    VideoCommon::SerializePipeline(u64{42}, envs, source, 53);
+    const auto before = ReadAll(source);
+    auto temporary = destination;
+    temporary += ".migrating";
+
+    SECTION("cancelled") {
+        std::stop_source stop;
+        stop.request_stop();
+        REQUIRE_FALSE(VideoCommon::MigratePipelines(
+            stop.get_token(), source, 53, destination, VideoCommon::VulkanPipelineCacheVersion,
+            sizeof(Vulkan::ComputePipelineCacheKey), sizeof(Vulkan::GraphicsPipelineCacheKey),
+            [](std::span<char>, std::span<const VideoCommon::FileEnvironment>) { return true; }));
+    }
+    SECTION("truncated source") {
+        std::filesystem::resize_file(source, std::filesystem::file_size(source) - 1);
+        REQUIRE_FALSE(VideoCommon::MigratePipelines(
+            {}, source, 53, destination, VideoCommon::VulkanPipelineCacheVersion,
+            sizeof(Vulkan::ComputePipelineCacheKey), sizeof(Vulkan::GraphicsPipelineCacheKey),
+            [](std::span<char>, std::span<const VideoCommon::FileEnvironment>) { return true; }));
+        CHECK(std::filesystem::exists(source)); // never deleted, unlike LoadPipelines
+    }
+    CHECK_FALSE(std::filesystem::exists(destination));
+    CHECK_FALSE(std::filesystem::exists(temporary));
 }

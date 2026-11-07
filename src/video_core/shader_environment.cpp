@@ -17,6 +17,7 @@
 #include <fstream>
 #include <memory>
 #include <optional>
+#include <system_error>
 #include <utility>
 
 #include "common/assert.h"
@@ -1319,6 +1320,93 @@ void LoadPipelines(
         LOG_ERROR(Common_Filesystem, "Failed to delete pipeline cache file {}",
                   Common::FS::PathToUTF8String(filename));
     }
+}
+
+bool MigratePipelines(
+    std::stop_token stop_migrating, const std::filesystem::path& source, u32 source_version,
+    const std::filesystem::path& destination, u32 destination_version, size_t compute_key_size,
+    size_t graphics_key_size,
+    Common::UniqueFunction<bool, std::span<char>, std::span<const FileEnvironment>>
+        fix_graphics_key) {
+    std::error_code error;
+    if (std::filesystem::exists(destination, error) || error) {
+        return false;
+    }
+    auto temporary = destination;
+    temporary += ".migrating";
+    try {
+        std::ifstream file(source, std::ios::binary | std::ios::ate);
+        if (!file.is_open()) {
+            return false;
+        }
+        file.exceptions(std::ifstream::failbit);
+        const auto end{file.tellg()};
+        file.seekg(0, std::ios::beg);
+        std::array<char, 8> magic_number;
+        u32 cache_version;
+        file.read(magic_number.data(), magic_number.size())
+            .read(reinterpret_cast<char*>(&cache_version), sizeof(cache_version));
+        if (magic_number != MAGIC_NUMBER || cache_version != source_version) {
+            // Another build's file; leave it alone.
+            return false;
+        }
+        std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
+        if (!out.is_open()) {
+            return false;
+        }
+        out.exceptions(std::ofstream::failbit);
+        out.write(MAGIC_NUMBER.data(), MAGIC_NUMBER.size())
+            .write(reinterpret_cast<const char*>(&destination_version),
+                   sizeof(destination_version));
+        std::vector<char> env_bytes;
+        std::vector<char> key;
+        while (file.tellg() != end) {
+            if (stop_migrating.stop_requested()) {
+                out.close();
+                std::filesystem::remove(temporary, error);
+                return false;
+            }
+            u32 num_envs{};
+            file.read(reinterpret_cast<char*>(&num_envs), sizeof(num_envs));
+            if (num_envs == 0) {
+                out.close();
+                std::filesystem::remove(temporary, error);
+                return false;
+            }
+            const std::streampos envs_begin{file.tellg()};
+            std::vector<FileEnvironment> envs(num_envs);
+            for (FileEnvironment& env : envs) {
+                env.Deserialize(file);
+            }
+            const std::streampos envs_end{file.tellg()};
+            const bool is_compute{envs.front().ShaderStage() == Shader::Stage::Compute};
+            key.resize(is_compute ? compute_key_size : graphics_key_size);
+            file.read(key.data(), static_cast<std::streamsize>(key.size()));
+            const std::streampos entry_end{file.tellg()};
+            if (!is_compute && !fix_graphics_key(std::span{key},
+                                                 std::span<const FileEnvironment>{envs})) {
+                continue; // dropped; the stream is already past this record
+            }
+            env_bytes.resize(static_cast<size_t>(envs_end - envs_begin));
+            file.seekg(envs_begin);
+            file.read(env_bytes.data(), static_cast<std::streamsize>(env_bytes.size()));
+            file.seekg(entry_end);
+            out.write(reinterpret_cast<const char*>(&num_envs), sizeof(num_envs))
+                .write(env_bytes.data(), static_cast<std::streamsize>(env_bytes.size()))
+                .write(key.data(), static_cast<std::streamsize>(key.size()));
+        }
+        out.close();
+    } catch (const std::ios_base::failure& e) {
+        LOG_ERROR(Common_Filesystem, "Pipeline cache migration failed: {}", e.what());
+        std::filesystem::remove(temporary, error);
+        return false;
+    }
+    std::filesystem::rename(temporary, destination, error);
+    if (error) {
+        std::filesystem::remove(temporary, error);
+        return false;
+    }
+    return true;
 }
 
 } // namespace VideoCommon

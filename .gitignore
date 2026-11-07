@@ -25,7 +25,8 @@ dist/english_plurals/generated_en.ts
 *.swp
 .idea/
 .vs/
-.vscode/
+.vscode/*
+!.vscode/tasks.json
 .cache/
 profile.json.gz
 CMakeLists.txt.user*
