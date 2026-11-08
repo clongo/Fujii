@@ -458,14 +458,24 @@ TEST_CASE("Handle tables are read for every element at once", "[video_core][text
         memory.words[0x2000 + 0x10 + element * 0x60] = 0x100 + element;
     }
     Shader::Info info;
-    info.storage_buffers_descriptors.push_back(
-        {.cbuf_index = 0, .cbuf_offset = 0x10, .count = 1, .is_written = false});
+    u32 binding = 0;
+    SECTION("First storage buffer") {}
+    SECTION("Storage buffer above the 32-bit mask") {
+        binding = 32;
+    }
+    SECTION("Last storage buffer") {
+        binding = 63;
+    }
+    info.storage_buffers_descriptors.resize(binding + 1);
+    info.storage_buffers_descriptors[binding] =
+        {.cbuf_index = 0, .cbuf_offset = 0x10, .count = 1, .is_written = false};
     using Op = Shader::HandleOp;
     // The word at Index * cbuf0[0x20] + 0x10 of the storage buffer.
     info.handle_programs.push_back({static_cast<u32>(Op::Index), static_cast<u32>(Op::Cbuf), 0U,
                                     0x20U, static_cast<u32>(Op::Mul),
                                     static_cast<u32>(Op::Immediate), 0x10U,
-                                    static_cast<u32>(Op::Add), static_cast<u32>(Op::Storage), 0U});
+                                    static_cast<u32>(Op::Add), static_cast<u32>(Op::Storage),
+                                    binding});
     u32 cbuf_reads{};
     const auto cbuf_address = [&cbuf_reads](u32 index) -> GPUVAddr {
         ++cbuf_reads;
@@ -859,4 +869,28 @@ TEST_CASE("Storage handle words are read from the host-aligned buffer base",
         CHECK(VideoCommon::EvaluateTextureHandle(info, 0, memory, cbuf_address, 16) == 0x11U);
         CHECK(VideoCommon::EvaluateTextureHandle(info, 0, memory, cbuf_address, 4) == 0x22U);
     }
+}
+
+TEST_CASE("A texture handle word that holds a storage buffer address is not a handle",
+          "[video_core][texture_handles]") {
+    Shader::Info info;
+    info.storage_buffers_descriptors.push_back({.cbuf_index = 0, .cbuf_offset = 0x520, .count = 1, .is_written = false});
+    Shader::TextureDescriptor desc{};
+    desc.cbuf_index = 0;
+    desc.cbuf_offset = 0x520;
+    desc.count = 1;
+    desc.size_shift = 3;
+    CHECK(VideoCommon::HandleIsStoragePointer(info, desc, 0));
+    desc.cbuf_offset = 0x524; // the address's upper word
+    CHECK(VideoCommon::HandleIsStoragePointer(info, desc, 0));
+    desc.cbuf_offset = 0x528;
+    CHECK_FALSE(VideoCommon::HandleIsStoragePointer(info, desc, 0));
+    desc.cbuf_offset = 0x518;
+    CHECK(VideoCommon::HandleIsStoragePointer(info, desc, 1)); // the second element
+    desc.cbuf_offset = 0x520;
+    desc.cbuf_index = 2;
+    CHECK_FALSE(VideoCommon::HandleIsStoragePointer(info, desc, 0));
+    desc.cbuf_index = 0;
+    desc.handle_program = 0; // computed for each draw: a real handle
+    CHECK_FALSE(VideoCommon::HandleIsStoragePointer(info, desc, 0));
 }

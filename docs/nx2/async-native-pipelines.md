@@ -68,7 +68,9 @@ Original cache files remain available to older builds. Captured native programs 
 contain lowered code: a changed lowering/hash can still require a fresh live capture.
 Task and mesh environments retain their serialized register and primitive-header state.
 Malformed shader counts and environment sizes are rejected before allocation: migration
-leaves the source untouched, while ordinary loading logs and removes an invalid cache.
+leaves the source untouched, while ordinary loading logs damage and truncates only the
+damaged record and those following it. Migration holds both cache locks, and clearing a
+cache leaves an empty current-version file when an older cache could otherwise restore it.
 
 Graphics pipelines are retained below the host-memory budget. Above it, only the oldest
 built, non-current pipelines unused for 9,000 frames are retired, and only enough to reach
