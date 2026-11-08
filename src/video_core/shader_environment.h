@@ -304,4 +304,18 @@ void LoadPipelines(std::stop_token stop_loading, const std::filesystem::path& fi
     Common::UniqueFunction<void, std::ifstream&, FileEnvironment> load_compute,
     Common::UniqueFunction<void, std::ifstream&, std::vector<FileEnvironment>> load_graphics);
 
+/// Rewrites the pipeline cache at `source`, whose header must carry `source_version`, to
+/// `destination` with `destination_version`. Each graphics record's key is passed to
+/// `fix_graphics_key` with its deserialized environments so the caller can rewrite it in place;
+/// the record is dropped when the callback returns false (keys that collapse into one another).
+/// The environments themselves are copied unchanged. Nothing happens when `destination` already
+/// exists, `source` is never modified, and a partial destination is never left behind.
+/// @return True when `destination` was written.
+bool MigratePipelines(
+    std::stop_token stop_migrating, const std::filesystem::path& source, u32 source_version,
+    const std::filesystem::path& destination, u32 destination_version, size_t compute_key_size,
+    size_t graphics_key_size,
+    Common::UniqueFunction<bool, std::span<char>, std::span<const FileEnvironment>>
+        fix_graphics_key);
+
 } // namespace VideoCommon

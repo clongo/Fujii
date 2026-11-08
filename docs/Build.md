@@ -193,3 +193,75 @@ Your compiled executable will be in:
 ## Scripts
 
 Take a look at our [CI scripts](https://github.com/Eglantine-CI/Workflow). You can use `.ci/common/configure.sh` on any POSIX-compliant shell, but you are heavily encouraged to instead write your own based. It's not really that hard, provided you can read CMake.
+
+## Windows x86_64 builds with Docker
+
+The [Windows build image](../tools/docker/windows/Dockerfile) builds native Windows
+x86_64 binaries using MSVC and Ninja. It includes Visual Studio 2022 Build Tools
+and the Windows SDK, Python 3.12.10, Git 2.49.0, CMake 3.31.10, Ninja 1.13.0,
+Qt 6.8.3 with Qt Charts, and Vulkan SDK 1.4.341.1. Other dependencies are downloaded
+by the repository's existing CPM configuration.
+The image explicitly preserves Windows system directories in PATH because the
+base image does not expose its default PATH through Docker image metadata.
+
+Requirements:
+
+- A Windows x86_64 host supporting Windows Server 2025 containers (for example
+  Windows 11 24H2 or later Pro/Enterprise with Hyper-V, or Windows Server 2025).
+- Docker configured for **Windows containers**, not Linux containers. In Docker
+  Desktop, select **Switch to Windows containers**.
+- Internet access during image creation and the first source build.
+- Ample disk space for the large Windows/toolchain image and build output.
+  Allow at least 8 GB of container memory; the 12-job example below uses 16 GB.
+  Reduce the CPU allocation, memory allocation, and build parallelism on smaller hosts.
+
+From the repository root, run these commands in PowerShell:
+
+```powershell
+docker build --isolation=hyperv --memory=8g -t lichii-build-windows .\tools\docker\windows
+docker run --rm --isolation=hyperv --cpus=12 --memory=16g `
+    --mount "type=bind,source=$($PWD.Path),target=C:\src" `
+    lichii-build-windows
+```
+
+In VS Code, press **Ctrl+Shift+B** or select **Tasks: Run Build Task** to run
+the default **Build Windows (Docker)** task from
+[tasks.json](../.vscode/tasks.json). This task allocates 20 CPUs and 20 GB of
+memory and uses 20 compiler jobs. It requires the `lichii-build-windows` image
+to have been built already; adjust the task's resource limits for smaller hosts.
+
+The image contains only build tools, not a copy of the source. The source mount
+must be writable: build output is saved to `build\docker-windows`, and CPM downloads
+are cached in `.cache\cpm` in the checkout. Both persist after the container exits.
+Keep this build directory separate from any host or Linux CMake build directory.
+Hyper-V containers default to only two virtual CPUs. Set `--cpus` explicitly:
+`-Jobs` controls compiler parallelism but does not allocate CPUs to the container.
+
+The GUI executable is `build\docker-windows\bin\lichii.exe`; the command-line
+executable is `build\docker-windows\bin\yuzu-cmd.exe`. The existing CMake
+post-build steps copy runtime DLLs and Qt plugins alongside them. Run the binaries
+on the Windows host, not inside the build container; keep the entire `bin` folder
+together. The host needs the x64 Visual C++ Redistributable for Visual Studio 2022
+and appropriate graphics drivers.
+
+For a build with debug symbols, fewer parallel jobs, and unit tests:
+
+```powershell
+docker run --rm --isolation=hyperv --cpus=4 --memory=8g `
+    --mount "type=bind,source=$($PWD.Path),target=C:\src" `
+    lichii-build-windows -BuildType RelWithDebInfo -Jobs 4 -Tests
+```
+
+The default is `Release`, 12 jobs, and no tests, matching the Windows release
+configuration apart from release publishing metadata. The
+[build script](../tools/docker/windows/build.ps1) also accepts `-SourceDir` and
+`-BuildDir` (paths inside the container). Image creation checks that the required
+tools were installed; source configuration, compilation, and optional tests each
+stop on failure.
+
+`ltsc2025` requires a compatible Windows host/kernel; Hyper-V isolation avoids
+process-isolation kernel mismatches on supported desktop hosts. This image cannot
+run on a Linux Docker daemon or Windows Home. The Visual Studio 2022 installer
+uses Microsoft's serviced release channel, so rebuilding the image may update
+MSVC and SDK servicing components. Review the Microsoft, Qt, and Vulkan SDK
+licenses before building or redistributing the image.

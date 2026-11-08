@@ -53,6 +53,19 @@ The pipeline cache drains its workers and explicitly destroys graphics pipelines
 pool cache and other build dependencies are still alive. Destruction may claim a queued native
 build; ordinary native draw waits never do.
 
+## Cache compatibility and retention
+
+Vulkan shader cache version 54 masks unused vertex attributes out of graphics keys.
+Version 53 records are migrated with remasked keys and deduplicated; the used-pipeline
+list follows the changed hashes. Original cache files remain available to older builds.
+Task and mesh environments retain their serialized register and primitive-header state.
+Malformed shader counts and environment sizes are rejected before allocation: migration
+leaves the source untouched, while ordinary loading logs and removes an invalid cache.
+
+Graphics pipelines are retained below the host-memory budget. Above it, only the oldest
+built, non-current pipelines unused for 9,000 frames are retired, and only enough to reach
+the budget. Retirement waits for GPU completion; MoltenVK does not evict these pipelines.
+
 ## Upstream alternative
 
 [Eglantine PR #503](https://github.com/Djihads80/Eglantine/pull/503), inspected at

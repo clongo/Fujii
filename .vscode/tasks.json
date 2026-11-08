@@ -1,0 +1,37 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Build Windows (Docker)",
+            "type": "process",
+            "command": "docker",
+            "args": [
+                "run",
+                "--rm",
+                "--isolation=hyperv",
+                "--cpus=20",
+                "--memory=20g",
+                "--mount",
+                "type=bind,source=${workspaceFolder},target=C:\\src",
+                "lichii-build-windows",
+                "-Jobs",
+                "20"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "problemMatcher": [],
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated"
+            },
+            "runOptions": {
+                "instanceLimit": 1
+            }
+        }
+    ]
+}
