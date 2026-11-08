@@ -56,8 +56,16 @@ build; ordinary native draw waits never do.
 ## Cache compatibility and retention
 
 Vulkan shader cache version 54 masks unused vertex attributes out of graphics keys.
-Version 53 records are migrated with remasked keys and deduplicated; the used-pipeline
-list follows the changed hashes. Original cache files remain available to older builds.
+On the first boot with a new version, the newest compatible shader cache is migrated
+with remasked keys and deduplicated; the used-pipeline list follows the changed hashes.
+The normal loader retranslates the saved guest environments with the current translator,
+at boot or through the existing background prebuild path. No old SPIR-V is copied.
+For version 57, sources are tried in order 56, 55, 54, 53; missing or malformed files
+fall back to the next source. An existing destination is never overwritten.
+`VulkanShaderCacheMinCompatibleVersion` is the serialized-layout boundary: raise it
+when environment or pipeline-key layouts change, not for translation-only bumps.
+Original cache files remain available to older builds. Captured native programs already
+contain lowered code: a changed lowering/hash can still require a fresh live capture.
 Task and mesh environments retain their serialized register and primitive-header state.
 Malformed shader counts and environment sizes are rejected before allocation: migration
 leaves the source untouched, while ordinary loading logs and removes an invalid cache.

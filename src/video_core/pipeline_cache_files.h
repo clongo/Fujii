@@ -18,11 +18,13 @@ namespace VideoCommon {
 inline constexpr u32 OpenGLPipelineCacheVersion = 48;
 inline constexpr u32 VulkanPipelineCacheVersion = 57;
 
+/// Oldest shader environment and pipeline key layout the current loader can retranslate.
+/// Raise this when either serialized layout changes, not for translation-only version bumps.
+inline constexpr u32 VulkanShaderCacheMinCompatibleVersion = 53;
+
 /// Earlier versions whose driver pipeline cache (vulkan_pipelines) is copied forward, newest
-/// first. From version 54 graphics keys mask the vertex attribute types a program doesn't read,
-/// so the version 53 shader cache is not copied. It is rewritten with remasked keys only when
-/// the destination version is 54 (MigrateV53ShaderCache in vk_pipeline_cache.cpp); later versions
-/// do not use that migration. Version 52's shader cache is not carried forward.
+/// first. Independent of shader environment migration: these are opaque driver blobs, not
+/// guest shader records that the current translator can rebuild.
 inline constexpr std::array<u32, 2> VulkanDriverCacheMigrationSources{53, 52};
 
 // Official Eglantine (cache version 18 at c0cb3325) and this fork (a different version) both

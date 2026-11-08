@@ -9,6 +9,7 @@
 #include <unordered_map>
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include "video_core/pipeline_cache_files.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
@@ -406,10 +407,13 @@ TEST_CASE("Cached compute failures retain their cause and the current dispatch a
     REQUIRE_THROWS_AS(entry->second.Get(true, 0x2120633c00, other), Shader::RuntimeError);
 }
 
-TEST_CASE("A version 53 shader cache migrates with rewritten graphics keys and intact records",
+TEST_CASE("Compatible shader caches migrate with rewritten graphics keys and intact records",
           "[pipeline_cache_files][attribute_keys]") {
+    const u32 source_version = GENERATE(53U, 54U, 55U, 56U);
+    CAPTURE(source_version);
     TempDir temp;
-    const auto source = VideoCommon::VersionedPipelineCachePath(temp.path, "vulkan", 53);
+    const auto source =
+        VideoCommon::VersionedPipelineCachePath(temp.path, "vulkan", source_version);
     const auto destination = VideoCommon::VersionedPipelineCachePath(
         temp.path, "vulkan", VideoCommon::VulkanPipelineCacheVersion);
 
@@ -421,7 +425,7 @@ TEST_CASE("A version 53 shader cache migrates with rewritten graphics keys and i
     {
         SerializedEnvironment env{Shader::Stage::Compute};
         const std::array<const VideoCommon::GenericEnvironment*, 1> envs{&env};
-        VideoCommon::SerializePipeline(compute_key, envs, source, 53);
+        VideoCommon::SerializePipeline(compute_key, envs, source, source_version);
     }
     Vulkan::GraphicsPipelineCacheKey graphics_key{};
     graphics_key.unique_hashes = {0, 0xabcd, 0, 0, 0, 0xef01};
@@ -433,8 +437,8 @@ TEST_CASE("A version 53 shader cache migrates with rewritten graphics keys and i
         SerializedEnvironment vertex{Shader::Stage::VertexB};
         SerializedEnvironment fragment{Shader::Stage::Fragment};
         const std::array<const VideoCommon::GenericEnvironment*, 2> envs{&vertex, &fragment};
-        VideoCommon::SerializePipeline(graphics_key, envs, source, 53);
-        VideoCommon::SerializePipeline(duplicate_key, envs, source, 53);
+        VideoCommon::SerializePipeline(graphics_key, envs, source, source_version);
+        VideoCommon::SerializePipeline(duplicate_key, envs, source, source_version);
     }
     const auto before = ReadAll(source);
 
@@ -442,7 +446,7 @@ TEST_CASE("A version 53 shader cache migrates with rewritten graphics keys and i
     fixed_key.state.attribute_types = 0x33;
     size_t graphics_seen = 0;
     REQUIRE(VideoCommon::MigratePipelines(
-        {}, source, 53, destination, VideoCommon::VulkanPipelineCacheVersion,
+        {}, source, source_version, destination, VideoCommon::VulkanPipelineCacheVersion,
         sizeof(Vulkan::ComputePipelineCacheKey), sizeof(Vulkan::GraphicsPipelineCacheKey),
         [&](std::span<char> key_bytes, std::span<const VideoCommon::FileEnvironment> envs) {
             ++graphics_seen;
@@ -491,27 +495,30 @@ TEST_CASE("A version 53 shader cache migrates with rewritten graphics keys and i
 
     // An existing destination is never replaced, and another version's file is never migrated.
     REQUIRE_FALSE(VideoCommon::MigratePipelines(
-        {}, source, 53, destination, VideoCommon::VulkanPipelineCacheVersion,
+        {}, source, source_version, destination, VideoCommon::VulkanPipelineCacheVersion,
         sizeof(Vulkan::ComputePipelineCacheKey), sizeof(Vulkan::GraphicsPipelineCacheKey),
         [](std::span<char>, std::span<const VideoCommon::FileEnvironment>) { return true; }));
     const auto wrong_version = temp.path / "wrong-version.bin";
     REQUIRE_FALSE(VideoCommon::MigratePipelines(
-        {}, source, 52, wrong_version, VideoCommon::VulkanPipelineCacheVersion,
+        {}, source, source_version - 1, wrong_version, VideoCommon::VulkanPipelineCacheVersion,
         sizeof(Vulkan::ComputePipelineCacheKey), sizeof(Vulkan::GraphicsPipelineCacheKey),
         [](std::span<char>, std::span<const VideoCommon::FileEnvironment>) { return true; }));
     CHECK_FALSE(std::filesystem::exists(wrong_version));
     CHECK(ReadAll(source) == before);
 }
 
-TEST_CASE("A cancelled or failed version 53 migration leaves no destination behind",
+TEST_CASE("A cancelled or failed compatible shader migration leaves no destination behind",
           "[pipeline_cache_files][attribute_keys]") {
+    const u32 source_version = GENERATE(53U, 54U, 55U, 56U);
+    CAPTURE(source_version);
     TempDir temp;
-    const auto source = VideoCommon::VersionedPipelineCachePath(temp.path, "vulkan", 53);
+    const auto source =
+        VideoCommon::VersionedPipelineCachePath(temp.path, "vulkan", source_version);
     const auto destination = VideoCommon::VersionedPipelineCachePath(
         temp.path, "vulkan", VideoCommon::VulkanPipelineCacheVersion);
     SerializedEnvironment env{Shader::Stage::Fragment};
     const std::array<const VideoCommon::GenericEnvironment*, 1> envs{&env};
-    VideoCommon::SerializePipeline(u64{42}, envs, source, 53);
+    VideoCommon::SerializePipeline(u64{42}, envs, source, source_version);
     const auto before = ReadAll(source);
     auto temporary = destination;
     temporary += ".migrating";
@@ -520,14 +527,15 @@ TEST_CASE("A cancelled or failed version 53 migration leaves no destination behi
         std::stop_source stop;
         stop.request_stop();
         REQUIRE_FALSE(VideoCommon::MigratePipelines(
-            stop.get_token(), source, 53, destination, VideoCommon::VulkanPipelineCacheVersion,
+            stop.get_token(), source, source_version, destination,
+            VideoCommon::VulkanPipelineCacheVersion,
             sizeof(Vulkan::ComputePipelineCacheKey), sizeof(Vulkan::GraphicsPipelineCacheKey),
             [](std::span<char>, std::span<const VideoCommon::FileEnvironment>) { return true; }));
     }
     SECTION("truncated source") {
         std::filesystem::resize_file(source, std::filesystem::file_size(source) - 1);
         REQUIRE_FALSE(VideoCommon::MigratePipelines(
-            {}, source, 53, destination, VideoCommon::VulkanPipelineCacheVersion,
+            {}, source, source_version, destination, VideoCommon::VulkanPipelineCacheVersion,
             sizeof(Vulkan::ComputePipelineCacheKey), sizeof(Vulkan::GraphicsPipelineCacheKey),
             [](std::span<char>, std::span<const VideoCommon::FileEnvironment>) { return true; }));
         CHECK(std::filesystem::exists(source)); // never deleted, unlike LoadPipelines
