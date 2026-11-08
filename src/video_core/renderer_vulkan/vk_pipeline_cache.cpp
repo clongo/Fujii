@@ -786,14 +786,16 @@ u64 FileVertexAttributeMask(const VideoCommon::FileEnvironment& env) {
 /// programs read (pipeline_cache_policy.h); nothing else changed in version 53's format. On the
 /// first boot after the bump, rewrite the version 53 shader cache as version 54 with remasked
 /// keys and carry the used-pipeline list across through the changed hashes, so neither is built
-/// again from scratch. The version 53 files are left in place for older builds.
+/// again from scratch. Only runs when the current cache version is 54; later versions may
+/// change more than the attribute mask. The version 53 files are left in place for older builds.
 void MigrateV53ShaderCache(const std::filesystem::path& base_dir,
                            const std::filesystem::path& destination,
                            const std::filesystem::path& used_destination,
                            std::stop_token stop_loading) {
     constexpr u32 SourceVersion = 53;
-    static_assert(VideoCommon::VulkanPipelineCacheVersion == SourceVersion + 1,
-                  "The version 53 migration only knows how 54 changed the keys");
+    if constexpr (VideoCommon::VulkanPipelineCacheVersion != SourceVersion + 1) {
+        return;
+    }
     const auto source = VideoCommon::VersionedPipelineCachePath(base_dir, "vulkan", SourceVersion);
     std::unordered_map<u64, u64> migrated_hashes;
     std::unordered_set<u64> emitted_hashes;
@@ -1491,6 +1493,12 @@ void PipelineCache::EvictUnusedPipelines() {
     if (device.IsMoltenVK()) {
         return;
     }
+    // EDEN_NX2_PRELOAD_ALL_PIPELINES asked for every cached pipeline built: evicting the ones not
+    // used yet threw the preload away after 9000 frames (Ocarina: 22,510 of 24,285, then rebuilt
+    // one by one in new places).
+    if (PreloadAllPipelines()) {
+        return;
+    }
     // Each built pipeline holds ~0.45 MB of driver memory and none was ever destroyed, so it grew
     // with every place a session went (title 1: 1,500 on its title screen alone). Past a budget of
     // 1/16 of host RAM, the least recently used ones unused for this long are destroyed. Below it
@@ -1893,6 +1901,21 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 "Binding {} storage buffers to a pipeline whose descriptor set binds {}",
                 storage_buffers, set_limit);
         }
+    }
+    {
+        // The descriptor set limits count the textures of every stage the pipeline emits.
+        std::array<Shader::IR::Program*, Maxwell::MaxShaderProgram> stages{};
+        size_t num_stages{};
+        for (size_t index = uses_vertex_a && uses_vertex_b ? 1 : 0;
+             index < Maxwell::MaxShaderProgram; ++index) {
+            const bool is_emulated_stage = layer_source_program != nullptr &&
+                                           index == static_cast<u32>(Maxwell::ShaderType::Geometry);
+            if (key.unique_hashes[index] != 0 || is_emulated_stage) {
+                stages[num_stages++] = &programs[index];
+            }
+        }
+        Shader::Optimization::LimitPipelineSampledTextureArrays(
+            std::span{stages.data(), num_stages}, host_info);
     }
     std::array<const Shader::Info*, Maxwell::MaxShaderStage> infos{};
     std::array<vk::ShaderModule, Maxwell::MaxShaderStage> modules;
@@ -2339,9 +2362,21 @@ vk::PipelineCache PipelineCache::LoadVulkanPipelineCache(const std::filesystem::
         file.read(cache_data.data(), cache_size);
 
         LOG_INFO(Render_Vulkan,
-                 "Loaded Vulkan driver pipeline cache: ", Common::FS::PathToUTF8String(filename));
+                 "Loaded Vulkan driver pipeline cache: {}", Common::FS::PathToUTF8String(filename));
 
-        return create_pipeline_cache(cache_size, cache_data.data());
+        try {
+            return create_pipeline_cache(cache_size, cache_data.data());
+        } catch (const vk::Exception& e) {
+            // The blob came from another driver or driver version (e.g. switching between
+            // MoltenVK and KosmicKrisp on macOS): the driver rejects it. Start empty instead of
+            // aborting, and drop the stale file so the next run doesn't retry it.
+            LOG_ERROR(Render_Vulkan,
+                      "Driver rejected the Vulkan pipeline cache file ({}), starting with an empty "
+                      "cache and deleting it",
+                      e.what());
+            Common::FS::RemoveFile(filename);
+            return create_pipeline_cache(0, nullptr);
+        }
 
     } catch (const std::ios_base::failure& e) {
         LOG_ERROR(Common_Filesystem, "{}", e.what());

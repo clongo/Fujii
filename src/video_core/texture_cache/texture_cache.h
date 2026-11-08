@@ -136,6 +136,41 @@ TextureCache<P>::TextureCache(Runtime& runtime_, Tegra::MaxwellDeviceMemoryManag
 }
 
 template <class P>
+void TextureCache<P>::DeleteDeadOverlaps() {
+    // A game that moves its render targets within a memory pool leaves the old images behind: on
+    // the real GPU their memory simply belongs to the new targets. Ocarina of Time does this every
+    // frame while the camera moves (its local shadow maps change size, which shifts what follows
+    // them), about 45 images a frame at a new address, far more than the collector removes. Images
+    // used in turn every frame are not touched: both stay recent.
+    static constexpr u64 MinFramesUnused = 2;
+    if (frame_tick <= MinFramesUnused) {
+        return;
+    }
+    dead_overlap_ids.clear();
+    lru_cache.ForEachItemBelow(frame_tick - MinFramesUnused, [this](ImageId image_id) {
+        const Image& image = slot_images[image_id];
+        if (True(image.flags & ImageFlagBits::IsDecoding)) {
+            return false;
+        }
+        for (const ImageId overlap_id : image.overlapping_images) {
+            if (slot_images[overlap_id].last_use_frame > image.last_use_frame) {
+                dead_overlap_ids.push_back(image_id);
+                break;
+            }
+        }
+        return false;
+    });
+    for (const ImageId image_id : dead_overlap_ids) {
+        Image& image = slot_images[image_id];
+        if (True(image.flags & ImageFlagBits::Tracked)) {
+            UntrackImage(image, image_id);
+        }
+        UnregisterImage(image_id);
+        DeleteImage(image_id, image.scale_tick > frame_tick + 5);
+    }
+}
+
+template <class P>
 void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
     bool high_priority_mode = false;
     bool aggressive_mode = false;
@@ -289,6 +324,7 @@ void TextureCache<P>::ApplyThresholdOverrides(bool log) {
 
 template <class P>
 void TextureCache<P>::TickFrame() {
+    DeleteDeadOverlaps();
     // Upload buffers grown for one huge image (title 1's 341 MiB terrain layer pools) are freed
     // rather than kept for the rest of the session.
     for (auto* const scratch : {&swizzle_data_buffer, &unswizzle_data_buffer}) {
@@ -818,15 +854,59 @@ bool TextureCache<P>::RescaleRenderTargets() {
 }
 
 template <class P>
+void TextureCache<P>::ResolveDeferredRtRefreshes() {
+    if (deferred_rt_refreshes.empty()) {
+        return;
+    }
+    const auto& regs = maxwell3d->regs;
+    const auto& clear = regs.clear_surface;
+    const auto is_deferred = [this](ImageId id) {
+        return std::ranges::find(deferred_rt_refreshes, id) != deferred_rt_refreshes.end();
+    };
+    // Only a target this clear really overwrites may skip its upload: IsFullClear looks at the
+    // area, not at which target and channels the clear selects. The others are uploaded now, with
+    // their alias copies: PrepareImage skips those when IsFullClear makes it invalidate the image.
+    const auto restore = [this](ImageId image_id) {
+        Image& image = slot_images[image_id];
+        RefreshContents(image, image_id);
+        if (!image.aliased_images.empty()) {
+            SynchronizeAliases(image_id);
+        }
+    };
+    for (size_t index = 0; index < NUM_RT; ++index) {
+        const ImageViewId view_id = render_targets.color_buffer_ids[index];
+        if (!view_id || slot_image_views[view_id].IsBuffer()) {
+            continue;
+        }
+        const ImageId image_id = slot_image_views[view_id].image_id;
+        if (!is_deferred(image_id)) {
+            continue;
+        }
+        const bool all_channels = clear.R && clear.G && clear.B && clear.A;
+        if (clear.RT != index || !all_channels || !IsFullClear(view_id)) {
+            restore(image_id);
+        }
+    }
+    const ImageViewId depth_id = render_targets.depth_buffer_id;
+    if (depth_id && !slot_image_views[depth_id].IsBuffer()) {
+        const ImageId image_id = slot_image_views[depth_id].image_id;
+        if (is_deferred(image_id)) {
+            const auto type = VideoCore::Surface::GetFormatType(slot_images[image_id].info.format);
+            const bool all_aspects =
+                (clear.Z || type == VideoCore::Surface::SurfaceType::Stencil) &&
+                (clear.S || type == VideoCore::Surface::SurfaceType::Depth) &&
+                (!clear.S || regs.stencil_front_mask == 0xFF);
+            if (!all_aspects || !IsFullClear(depth_id)) {
+                restore(image_id);
+            }
+        }
+    }
+    deferred_rt_refreshes.clear();
+}
+
+template <class P>
 void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
     using namespace VideoCommon::Dirty;
-    struct ClearingScope {
-        bool& flag;
-        ~ClearingScope() {
-            flag = false;
-        }
-    } clearing_scope{clearing_render_targets};
-    clearing_render_targets = is_clear;
     auto& flags = maxwell3d->dirty.flags;
     if (!flags[Dirty::RenderTargets]) {
         for (size_t index = 0; index < NUM_RT; ++index) {
@@ -839,7 +919,11 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
     }
 
     const VideoCommon::RenderTargets previous_render_targets = render_targets;
+    deferred_rt_refreshes.clear();
+    defer_rt_refresh = is_clear;
     const bool rescaled = RescaleRenderTargets();
+    defer_rt_refresh = false;
+    ResolveDeferredRtRefreshes();
     if (is_rescaling != rescaled) {
         flags[Dirty::RescaleViewports] = true;
         flags[Dirty::RescaleScissors] = true;
@@ -1129,15 +1213,8 @@ template <class P>
 bool TextureCache<P>::BlitImage(const Tegra::Engines::Fermi2D::Surface& dst,
                                 const Tegra::Engines::Fermi2D::Surface& src,
                                 const Tegra::Engines::Fermi2D::Config& copy) {
-    // A deferred clear parked before this copy has to land before it: realizing it afterwards
-    // starts its clear pass after the copy and wipes what the copy wrote. That is what made
-    // Ocarina of Time draw its terrain layer over the scene (#101): the game clears the
-    // occlusion depth, blits the scene depth over it, and reads it back during the layer draw.
-    // GetFramebufferId only flushes when it creates a framebuffer, so the bug starts on the
-    // second frame. Texture cache copies bypass render passes and keep stream order here.
-    // Only when the copy proceeds: a rejected blit writes nothing and must not realize the
-    // clear ahead of the next draw that consumes it as its load-op. GetBlitImages cannot
-    // invalidate the parked clear: framebuffer removal flushes first (RemoveFramebuffers).
+    // Land a parked deferred clear before the copy, or its clear pass would wipe what the copy
+    // wrote (#101). Only when the blit proceeds: a rejected blit writes nothing.
     const auto result = GetBlitImages(dst, src, copy);
     if (!result) {
         return false;
@@ -2351,6 +2428,11 @@ u64 TextureCache<P>::GetScaledImageSizeBytes(const ImageBase& image) {
 
 template <class P>
 u64 TextureCache<P>::ImageMemoryBytes(const Image& image) const {
+    if constexpr (requires { image.HasOriginalImage(); }) {
+        if (!image.HasOriginalImage() && False(image.flags & ImageFlagBits::Unbacked)) {
+            return 0;
+        }
+    }
     if (True(image.flags & ImageFlagBits::Unbacked)) {
         // No device memory but what BindLayers gave a SparseLayers image: at its full size (GBs
         // for title 1's sparse terrain images), deleting it would look to the collector like
@@ -2728,6 +2810,11 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             }
         }
     }
+    // A render target with nothing to take from another image only ever uses its scaled image.
+    new_info.scaled_only = inserting_render_target && new_info.rescaleable && !new_info.is_sparse &&
+                           new_info.type == ImageType::e2D && new_info.num_samples == 1 &&
+                           Settings::values.resolution_info.active && join_copies_to_do.empty() &&
+                           !IsPixelFormatASTC(new_info.format) && !IsPixelFormatBCn(new_info.format);
     const ImageId new_image_id = slot_images.insert(runtime, new_info, gpu_addr, cpu_addr);
     if constexpr (requires(const Image& image) { image.OutOfMemory(); }) {
         if (slot_images[new_image_id].OutOfMemory()) {
@@ -2744,6 +2831,13 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         }
     }
     Image& new_image = slot_images[new_image_id];
+    bool started_scaled = false;
+    if constexpr (requires { new_image.StartScaled(); }) {
+        started_scaled = new_image.StartScaled();
+        if (started_scaled) {
+            total_used_memory += GetScaledImageSizeBytes(new_image);
+        }
+    }
 
     new_image.allocation_tick = frame_tick;
     {
@@ -2778,57 +2872,44 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         DeleteImage(overlap_id);
     }
 
-    // A new render target that the clear binding it overwrites whole (every channel, the whole
-    // image) needs no upload from guest memory first: Ocarina of Time creates ~4 such targets a
-    // frame outdoors, and uploading them was ~15% of the GPU back thread.
-    const auto overwritten_by_clear = [&] {
-        if (!clearing_render_targets || !join_copies_to_do.empty() ||
-            new_info.type != ImageType::e2D || new_info.resources.levels != 1 ||
-            new_info.resources.layers != 1 || new_info.num_samples != 1) {
-            return false;
+    // A render target created while a clear binds its targets usually never needs its guest
+    // contents: leave it CpuModified, UpdateRenderTargets uploads it unless the clear overwrites
+    // all of it (ResolveDeferredRtRefreshes). Images that receive non-alias copies below must be
+    // uploaded first, or the upload would overwrite the copies. Alias copies can wait
+    // (ResolveDeferredRtRefreshes runs them with the upload); overlaps merged into the image can't,
+    // they get deleted.
+    // A new render target over memory whose last contents only the GPU has: the guest bytes are
+    // stale, and a target newly placed in that memory has no defined contents anyway.
+    const bool over_gpu_contents =
+        inserting_render_target && join_copies_to_do.empty() &&
+        std::ranges::any_of(join_bad_overlap_ids, [this](ImageId overlap_id) {
+            return True(slot_images[overlap_id].flags & ImageFlagBits::GpuModified);
+        });
+    const bool deferred_refresh =
+        !over_gpu_contents && defer_rt_refresh &&
+        std::ranges::all_of(join_copies_to_do, [](const JoinCopy& copy) {
+            return copy.is_alias;
+        });
+    if (over_gpu_contents) {
+        new_image.flags &= ~ImageFlagBits::CpuModified;
+        if (False(new_image.flags & ImageFlagBits::Tracked)) {
+            TrackImage(new_image, new_image_id);
         }
-        const auto& regs = maxwell3d->regs;
-        const auto& surface = regs.clear_surface;
-        if (surface.layer != 0) {
-            return false;
-        }
-        const u32 width = new_info.size.width;
-        const u32 height = new_info.size.height;
-        if (!ClearCovers(width, height)) {
-            return false;
-        }
-        // The clear covers the framebuffer's render area, the smallest bound target.
-        for (u32 index = 0; index < regs.rt_control.count && index < NUM_RT; ++index) {
-            const auto& rt = regs.rt[index];
-            if (rt.Address() != 0 && rt.format != Tegra::RenderTargetFormat::NONE &&
-                (rt.width < width || rt.height < height)) {
-                return false;
-            }
-        }
-        if (regs.zeta_enable && regs.zeta.Address() != 0 &&
-            (regs.zeta_size.width < width || regs.zeta_size.height < height)) {
-            return false;
-        }
-        const bool is_depth_target = regs.zeta_enable && regs.zeta.Address() == gpu_addr;
-        const bool full_stencil = surface.S && regs.stencil_front_mask == 0xFF;
-        switch (VideoCore::Surface::GetFormatType(new_info.format)) {
-        case VideoCore::Surface::SurfaceType::ColorTexture: {
-            // OpenGL clears draw buffer RT, which writes target rt_control.Map(RT).
-            const u32 index = surface.RT;
-            return surface.R && surface.G && surface.B && surface.A && index < NUM_RT &&
-                   index < regs.rt_control.count && regs.rt_control.Map(index) == index &&
-                   regs.rt[index].Address() == gpu_addr;
-        }
-        case VideoCore::Surface::SurfaceType::Depth:
-            return is_depth_target && surface.Z;
-        case VideoCore::Surface::SurfaceType::Stencil:
-            return is_depth_target && full_stencil;
-        case VideoCore::Surface::SurfaceType::DepthStencil:
-            return is_depth_target && surface.Z && full_stencil;
-        default:
-            return false;
-        }
-    };
+        runtime.TransitionImageLayout(new_image);
+    } else if (deferred_refresh) {
+        deferred_rt_refreshes.push_back(new_image_id);
+        runtime.TransitionImageLayout(new_image);
+    } else {
+        // TODO: Only upload what we need
+        RefreshContents(new_image, new_image_id);
+    }
+
+    if (can_rescale) {
+        ScaleUp(new_image);
+    } else if (!started_scaled) {
+        ScaleDown(new_image);
+    }
+
     std::ranges::sort(join_copies_to_do, [this](const JoinCopy& lhs, const JoinCopy& rhs) {
         const ImageBase& lhs_image = slot_images[lhs.id];
         const ImageBase& rhs_image = slot_images[rhs.id];
@@ -2868,105 +2949,24 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         }
     }
 
-    // The copy from an alias into the new image, or null when the loop below skips it.
-    const auto alias_copy = [&](const JoinCopy& copy) -> const AliasedImage* {
-        if (!copy.is_alias) {
-            return nullptr;
-        }
-        const Image& overlap = slot_images[copy.id];
-        if (!overlap.IsSafeGpuCopy() || overlap.info.num_samples != new_image.info.num_samples) {
-            return nullptr;
-        }
-        const auto alias_pointer = join_alias_indices.find(copy.id);
-        if (alias_pointer == join_alias_indices.end()) {
-            return nullptr;
-        }
-        return &new_image.aliased_images[alias_pointer->second];
-    };
-    // Whether that copy writes every texel of the new image: a plain copy (same format) of every
-    // level and layer from its origin. Sparse and unbacked images still need RefreshContents to
-    // bind their memory.
-    const auto writes_whole_image = [&](const AliasedImage& aliased) {
-        const Image& source = slot_images[aliased.id];
-        if (new_image.info.type != ImageType::e2D || source.info.type != ImageType::e2D ||
-            source.info.format != new_image.info.format ||
-            source.info.astc_opaque != new_image.info.astc_opaque ||
-            True((source.flags | new_image.flags) & ImageFlagBits::UnwrittenSparse) ||
-            True(new_image.flags & (ImageFlagBits::SparseLayers | ImageFlagBits::SparseTiles |
-                                    ImageFlagBits::Unbacked))) {
-            return false;
-        }
-        const u32 block_width = VideoCore::Surface::DefaultBlockWidth(new_image.info.format);
-        const u32 block_height = VideoCore::Surface::DefaultBlockHeight(new_image.info.format);
-        if (can_rescale && (block_width > 1 || block_height > 1)) {
-            // CopyImage scales a rescaled copy's extent in blocks, which can round below the
-            // scaled image's size in blocks.
-            return false;
-        }
-        for (s32 level = 0; level < new_image.info.resources.levels; ++level) {
-            const Extent3D size = MipSize(new_image.info.size, level);
-            const u32 width = Common::DivCeil(size.width, block_width);
-            const u32 height = Common::DivCeil(size.height, block_height);
-            const bool covered = std::ranges::any_of(aliased.copies, [&](const ImageCopy& copy) {
-                return copy.dst_subresource.base_level == level &&
-                       copy.dst_subresource.base_layer == 0 &&
-                       copy.dst_subresource.num_layers >= new_image.info.resources.layers &&
-                       copy.dst_offset == Offset3D{} && copy.extent.width >= width &&
-                       copy.extent.height >= height;
-            });
-            if (!covered) {
-                return false;
-            }
-        }
-        return true;
-    };
-    // Copies run oldest first. When one of them writes the whole image, the upload from guest
-    // memory and the alias copies before it would be overwritten whole: neither is made. Ocarina
-    // of Time resizes a shadow map every frame in parts of Kokiri Forest, at the same address:
-    // each size is a new depth target and a new texture, both copied from older sizes, and their
-    // uploads took up to 17% of the GPU back thread there.
-    size_t first_copy = 0;
-    bool copied_whole = false;
-    for (size_t index = join_copies_to_do.size(); index-- > 0;) {
-        const AliasedImage* const aliased = alias_copy(join_copies_to_do[index]);
-        if (aliased != nullptr && writes_whole_image(*aliased)) {
-            first_copy = index;
-            copied_whole = true;
-            break;
-        }
-    }
-    if (overwritten_by_clear()) {
-        // Stays CpuModified: UpdateRenderTargets' PrepareImage drops the upload only when
-        // IsFullClear agrees the clear covers the whole image, and uploads it otherwise.
-        runtime.TransitionImageLayout(new_image);
-    } else if (copied_whole) {
-        // What RefreshContents does, without the upload.
-        new_image.flags &= ~ImageFlagBits::CpuModified;
-        if (False(new_image.flags & ImageFlagBits::Tracked)) {
-            TrackImage(new_image, new_image_id);
-        }
-        runtime.TransitionImageLayout(new_image);
-    } else {
-        // TODO: Only upload what we need
-        RefreshContents(new_image, new_image_id);
-    }
-
-    if (can_rescale) {
-        ScaleUp(new_image);
-    } else {
-        ScaleDown(new_image);
-    }
-
-    for (size_t index = 0; index < join_copies_to_do.size(); ++index) {
-        const JoinCopy& copy_object = join_copies_to_do[index];
+    for (const auto& copy_object : join_copies_to_do) {
         Image& overlap = slot_images[copy_object.id];
         if (copy_object.is_alias) {
-            const AliasedImage* const aliased =
-                index >= first_copy ? alias_copy(copy_object) : nullptr;
-            if (aliased == nullptr) {
+            if (deferred_refresh) {
                 continue;
             }
-            CopyImage(new_image_id, aliased->id, aliased->copies);
+            if (!overlap.IsSafeGpuCopy()) {
+                continue;
+            }
+            if (overlap.info.num_samples != new_image.info.num_samples) {
+                continue;
+            }
+            const auto alias_pointer = join_alias_indices.find(copy_object.id);
+            if (alias_pointer == join_alias_indices.end()) {
+                continue;
+            }
+            const AliasedImage& aliased = new_image.aliased_images[alias_pointer->second];
+            CopyImage(new_image_id, aliased.id, aliased.copies);
             new_image.modification_tick = overlap.modification_tick;
             continue;
         }
@@ -3191,8 +3191,27 @@ ImageViewId TextureCache<P>::FindDepthBuffer() {
     if (gpu_addr == 0) {
         return ImageViewId{};
     }
-    const ImageInfo info(regs.zeta, regs.zeta_size, regs.anti_alias_samples_mode);
-    return FindRenderTargetView(info, gpu_addr);
+    ImageInfo info(regs.zeta, regs.zeta_size, regs.anti_alias_samples_mode);
+    // Ocarina of Time renders its shadow maps with the width aligned up to 16 (800x793), then
+    // samples them as the square texture they are (793x793) at the same address. Two images meant
+    // a copy between them for each new size, and these change every frame while the camera moves.
+    if (info.format == VideoCore::Surface::PixelFormat::D32_FLOAT && info.type == ImageType::e2D &&
+        info.size.width != info.size.height && info.size.width == Common::AlignUp(info.size.height, 16U)) {
+        info.size.width = info.size.height;
+    }
+    // A square depth target with no color target is a shadow map: its size doesn't set the output
+    // resolution, and scaling it only multiplies its memory by the square of the scale (648 MiB for
+    // Ocarina of Time's 12288x12288 sun shadow map at 1.5x). A full-screen depth prepass isn't square.
+    const bool shadow_map = regs.rt_control.count == 0 && info.size.width == info.size.height;
+    if (shadow_map) {
+        info.rescaleable = false;
+    }
+    const ImageViewId view_id = FindRenderTargetView(info, gpu_addr);
+    if (shadow_map && view_id && view_id != NULL_IMAGE_VIEW_ID) {
+        // The image may exist already, made when a texture read it first.
+        slot_images[slot_image_views[view_id].image_id].info.rescaleable = false;
+    }
+    return view_id;
 }
 
 template <class P>
@@ -3209,7 +3228,9 @@ ImageViewId TextureCache<P>::FindRenderTargetView(const ImageInfo& info, GPUVAdd
     bool delete_state = has_deleted_images;
     do {
         has_deleted_images = false;
+        inserting_render_target = true;
         image_id = FindOrInsertImage(info, gpu_addr);
+        inserting_render_target = false;
         delete_state |= has_deleted_images;
     } while (has_deleted_images);
     has_deleted_images = delete_state;
@@ -3911,6 +3932,7 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool 
         MarkModification(image);
     }
     lru_cache.Touch(image.lru_index, frame_tick);
+    image.last_use_frame = frame_tick;
 }
 
 template <class P>

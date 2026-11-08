@@ -508,9 +508,9 @@ IR::Program MergeDualVertexPrograms(IR::Program& vertex_a, IR::Program& vertex_b
     result.info.loads.mask |= vertex_b.info.loads.mask;
     result.info.stores.mask |= vertex_b.info.stores.mask;
 
-    // Vertex B's descriptors and storage buffers join Vertex A's, which keep their indices; its
-    // handle programs and the instructions of its blocks read them where they are here. The two
-    // halves are one stage: their storage buffers share its limit.
+    // The two halves are one stage: their storage buffers share its limit. Vertex B's
+    // descriptors and storage buffers join Vertex A's, which keep their indices; its handle
+    // programs and the instructions of its blocks read them where they are here.
     const auto storage_bindings{Optimization::JoinStorageInfo(
         result.info, vertex_b.info, Optimization::StorageBufferLimit(host_info))};
     const auto descriptors{
